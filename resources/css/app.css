@@ -1,0 +1,36 @@
+@import 'tailwindcss';
+
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../**/*.blade.php';
+@source '../**/*.js';
+
+@theme {
+    --font-sans: 'Avenir Next', 'Segoe UI', ui-sans-serif, system-ui, sans-serif;
+    --color-primary: #427A54;
+    --color-primary-dark: #315f40;
+    --color-cream: #FFF8EB;
+    --color-accent: #F2A65A;
+    --color-ink: #25332B;
+    --color-muted: #637068;
+    --color-sage: #EDF3EB;
+    --color-line: #E4E9E1;
+    --shadow-soft: 0 12px 40px -16px rgb(37 51 43 / 18%);
+}
+
+@layer base {
+    html { scroll-behavior: smooth; }
+    button, a, input { -webkit-tap-highlight-color: transparent; }
+    button:not(:disabled), a { cursor: pointer; }
+    :focus-visible { outline: 2px solid var(--color-primary); outline-offset: 4px; }
+    [hidden] { display: none !important; }
+    @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
+    }
+}
+
+@layer components {
+    .page-container { @apply mx-auto w-full max-w-6xl px-5 sm:px-8; }
+    .nav-link { @apply rounded-md py-2 transition hover:text-primary; }
+    .eyebrow { @apply text-[11px] font-bold tracking-[0.16em] text-primary; }
+    .section-title { @apply mt-3 text-3xl leading-tight font-bold tracking-[-0.035em] sm:text-4xl; }
+}

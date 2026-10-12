@@ -1,0 +1,1 @@
+<p class="mt-5 max-w-2xl text-sm leading-7 text-muted">Data ini terkait dengan sesi browsermu. Jika sesi hilang, browser berganti, atau cookie dihapus, data mungkin tidak dapat diakses kembali. Favorit belum tersinkronisasi antarperangkat.</p>
