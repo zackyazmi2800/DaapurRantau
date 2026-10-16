@@ -115,10 +115,11 @@ class AvailableRecipesTest extends TestCase
     {
         foreach ([0, 1, 2, 3] as $count) {
             Cache::flush();
+            $source = $this->normal();
             $data = $this->recipeData();
             $data['recipes'] = array_slice($data['recipes'], 0, $count);
             $this->fakeProvider(['*' => Http::response($this->geminiBody($data))]);
-            $response = $this->post('/rekomendasi', ['ingredients' => ['telur', 'air', 'garam', 'minyak', 'wortel', 'daun bawang'], 'mode' => RecipeMode::STRICT])->assertOk();
+            $response = $this->post(route('recommendations.alternatives', $source['id']), ['confirmed' => array_map(fn ($name) => hash('sha256', $name), ['telur', 'air', 'garam', 'minyak', 'wortel', 'daun bawang'])])->assertOk();
             $snapshot = $response->viewData('snapshot');
             $this->assertCount($count, $snapshot['recipes']);
             $response->assertDontSee('Paling Cocok')->assertDontSee('Cukup Cocok')->assertDontSee('Alternatif Menu');
@@ -155,15 +156,39 @@ class AvailableRecipesTest extends TestCase
         Http::assertNothingSent();
     }
 
-    public function test_strict_history_repeat_preserves_mode_without_generating_again(): void
+    public function test_strict_edit_and_history_return_to_normal_without_losing_snapshots(): void
     {
-        $this->fakeProvider(['*' => Http::response($this->geminiBody(['message' => 'Tidak ada menu.', 'recipes' => []]))]);
-        $ingredients = array_map(fn ($i) => 'bahan '.$i, range(1, 16));
-        $this->post('/rekomendasi', ['ingredients' => $ingredients, 'mode' => RecipeMode::STRICT])->assertOk();
+        $normal = $this->normal();
+        $strict = $this->post(route('recommendations.alternatives', $normal['id']), [
+            'confirmed' => [hash('sha256', 'telur'), hash('sha256', 'air')],
+        ])->assertOk()->viewData('snapshot');
+        $this->assertCount(1, $strict['recipes']);
         $history = RecipeSearch::latest('id')->first();
-        $this->get(route('history.repeat', $history->id))->assertRedirect();
-        $this->get('/')->assertOk()->assertSee('value="STRICT_AVAILABLE_INGREDIENTS"', false)->assertSee('data-ingredient-limit="105"', false);
-        Http::assertSentCount(1);
+        $this->fakeProvider([]);
+        foreach ([route('recommendations.edit', $strict['id']), route('history.repeat', $history->id)] as $url) {
+            $this->get($url)->assertRedirect()->assertSessionHas('_old_input.mode', RecipeMode::NORMAL);
+            $this->get('/')->assertOk()->assertDontSee('name="mode"', false)->assertSee('data-ingredient-limit="15"', false);
+        }
+        // A stale/tampered browser still cannot select strict through Cari Ide.
+        $result = $this->post('/rekomendasi', ['ingredients' => ['telur', 'air'], 'allergies' => 'udang', 'mode' => RecipeMode::STRICT])->assertOk()->viewData('snapshot');
+        $this->assertSame(RecipeMode::NORMAL, $result['input']['mode']);
+        $this->assertCount(3, $result['recipes']);
+        $this->assertCount(3, array_unique(array_column($result['recipes'], 'title')));
+        foreach ([$normal, $strict] as $snapshot) {
+            $this->get(route('recommendations.detail', [$snapshot['id'], $snapshot['recipes'][0]['id']]))->assertOk();
+        }
+        Http::assertNothingSent();
+    }
+
+    public function test_cari_ide_ignores_invalid_mode_and_enforces_normal_limit(): void
+    {
+        $this->normal();
+        $this->fakeProvider([]);
+        $response = $this->post('/rekomendasi', ['ingredients' => ['telur', 'air'], 'allergies' => 'udang', 'mode' => ['invalid']])->assertOk();
+        $this->assertSame(RecipeMode::NORMAL, $response->viewData('snapshot')['input']['mode']);
+        $this->postJson('/rekomendasi', ['ingredients' => array_map(fn ($i) => 'bahan '.$i, range(1, 16)), 'mode' => RecipeMode::STRICT])
+            ->assertUnprocessable()->assertJsonValidationErrors('ingredients');
+        Http::assertNothingSent();
     }
 
     public function test_strict_filters_missing_ingredients_and_does_not_cache_rejected_recipes(): void

@@ -6,6 +6,7 @@ use App\Exceptions\RecipeGenerationException;
 use App\Support\GeminiErrorDiagnostics;
 use App\Support\RecipeCacheKey;
 use App\Support\RecipeMode;
+use GuzzleHttp\TransferStats;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
@@ -23,6 +24,18 @@ class GeminiRecipeService
 
     public function generateRecipes(array $input): array
     {
+        // Local web PHP may have a 30s execution limit, while this operation
+        // permits two bounded HTTP calls. Leave time for validation and quota
+        // cleanup instead of letting PHP terminate inside cURL. Do not reset
+        // this timer per attempt or change production worker configuration.
+        if (app()->environment('local') && function_exists('set_time_limit')) {
+            $executionBudget = 2 * min(60, max(1, (int) config('ai.gemini.timeout'))) + 30;
+            $currentLimit = (int) ini_get('max_execution_time');
+            if ($currentLimit > 0 && $currentLimit < $executionBudget) {
+                set_time_limit($executionBudget);
+            }
+        }
+
         $started = microtime(true);
         $cacheStatus = config('ai.cache.enabled') ? 'miss' : 'disabled';
         $lock = null;
@@ -115,10 +128,27 @@ class GeminiRecipeService
             'generationConfig' => $generation,
         ];
         $fallback = null;
+        // Diagnostic identifiers must never affect recipe generation.
+        try {
+            $correlationId = bin2hex(random_bytes(16));
+        } catch (Throwable) {
+            $correlationId = null;
+        }
         for ($attempt = 0; $attempt < 2; $attempt++) {
             $started = microtime(true);
+            $transportStats = null;
             try {
                 $response = Http::acceptJson()->asJson()
+                    ->withOptions(['on_stats' => function ($stats) use (&$transportStats): void {
+                        // Do not retain the request, response, headers or URL.
+                        try {
+                            if ($stats instanceof TransferStats) {
+                                $transportStats = $this->transportMetadata($stats);
+                            }
+                        } catch (Throwable) {
+                            $transportStats = null;
+                        }
+                    }])
                     ->withHeaders(['x-goog-api-key' => config('ai.gemini.api_key')])
                     ->withoutRedirecting()
                     ->connectTimeout((int) config('ai.gemini.connect_timeout'))->timeout(min(60, max(1, (int) config('ai.gemini.timeout'))))
@@ -129,6 +159,8 @@ class GeminiRecipeService
                     return $fallback;
                 }
                 throw new RecipeGenerationException('connection_or_timeout');
+            } finally {
+                $this->logTransport($correlationId, $attempt + 1, $transportStats);
             }
             $this->logUsage($response, $started, $attempt + 1);
             if ($response->successful()) {
@@ -510,6 +542,62 @@ PROMPT;
 
         // Do not block PHP workers on long provider backoffs; never retry earlier than requested.
         return $delay <= 2 ? $delay : null;
+    }
+
+    private function transportMetadata(TransferStats $stats): array
+    {
+        $handler = $stats->getHandlerStats();
+        $seconds = static function (mixed $value): ?float {
+            return (is_int($value) || is_float($value)) && is_finite((float) $value) && $value >= 0
+                ? (float) $value : null;
+        };
+        $milliseconds = static fn (?float $value): ?float => $value === null ? null : round($value * 1000, 3);
+        // cURL phase timestamps are cumulative. Zero endpoints can mean the
+        // phase never completed or a connection was reused, so leave them null.
+        $phase = static function (?float $end, ?float $start) use ($milliseconds): ?float {
+            return $end !== null && $start !== null && $end > 0 && $end >= $start
+                ? $milliseconds($end - $start) : null;
+        };
+        $dns = $seconds($handler['namelookup_time'] ?? null);
+        $connect = $seconds($handler['connect_time'] ?? null);
+        $tls = $seconds($handler['appconnect_time'] ?? null);
+        $firstByte = $seconds($handler['starttransfer_time'] ?? null);
+        $error = $stats->getHandlerErrorData();
+        // These cURL-specific fields establish the provenance of numeric errno.
+        $curlStats = array_key_exists('namelookup_time', $handler)
+            && array_key_exists('appconnect_time', $handler)
+            && array_key_exists('ssl_verify_result', $handler);
+
+        return [
+            'dns_time_ms' => $dns !== null && $dns > 0 ? $milliseconds($dns) : null,
+            'tcp_connect_time_ms' => $phase($connect, $dns),
+            'tls_handshake_time_ms' => $phase($tls, $connect),
+            // TTFB is cumulative from transfer start, not TLS completion.
+            'time_to_first_byte_ms' => $firstByte !== null && $firstByte > 0 ? $milliseconds($firstByte) : null,
+            'total_time_ms' => $milliseconds($seconds($stats->getTransferTime())),
+            'http_status' => $stats->getResponse()?->getStatusCode(),
+            'curl_errno' => $curlStats && is_int($error) && $error >= 0 ? $error : null,
+        ];
+    }
+
+    private function logTransport(?string $correlationId, int $attempt, ?array $metadata): void
+    {
+        try {
+            // Explicit allowlist: never log raw handler stats or exceptions.
+            Log::info('gemini.transport', [
+                'correlation_id' => $correlationId,
+                'attempt_number' => $attempt,
+                'dns_time_ms' => $metadata['dns_time_ms'] ?? null,
+                'tcp_connect_time_ms' => $metadata['tcp_connect_time_ms'] ?? null,
+                'tls_handshake_time_ms' => $metadata['tls_handshake_time_ms'] ?? null,
+                'time_to_first_byte_ms' => $metadata['time_to_first_byte_ms'] ?? null,
+                'total_time_ms' => $metadata['total_time_ms'] ?? null,
+                'http_status' => $metadata['http_status'] ?? null,
+                'curl_errno' => $metadata['curl_errno'] ?? null,
+            ]);
+        } catch (Throwable) {
+            // Observability failures must not change generation or fallback.
+        }
     }
 
     private function logUsage(Response $response, float $started, int $attempt): void

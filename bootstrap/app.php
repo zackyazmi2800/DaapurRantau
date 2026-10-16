@@ -13,9 +13,25 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        $middleware->web(append: [PrivateWebResponse::class]);
+        $middleware->web(append: [PrivateWebResponse::class, \App\Http\Middleware\VerifiedAccountSession::class, \Illuminate\Session\Middleware\AuthenticateSession::class, \App\Http\Middleware\GuestIdentity::class]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->dontFlash(['password', 'password_confirmation', 'current_password', 'otp', 'token']);
+        $exceptions->render(fn (\App\Exceptions\SqliteBusyException $exception, Request $request) => \App\Support\SqliteContention::response($request));
+        $exceptions->dontReport([\App\Exceptions\SqliteBusyException::class]);
+        // Also cover contention in session/cache/throttle outside the controller.
+        $exceptions->render(function (\Illuminate\Database\QueryException $exception, Request $request) {
+            if (\App\Support\SqliteContention::isBusy($exception)) {
+                return \App\Support\SqliteContention::response($request);
+            }
+        });
+        $exceptions->report(function (\Illuminate\Database\QueryException $exception) {
+            if (\App\Support\SqliteContention::isBusy($exception)) {
+                \Illuminate\Support\Facades\Log::warning('database.contention', ['driver' => 'sqlite', 'status' => 'busy']);
+
+                return false; // Never log SQL bindings, session payloads or raw exception.
+            }
+        });
         $exceptions->shouldRenderJsonWhen(
             fn (Request $request) => $request->is('api/*') || $request->expectsJson(),
         );

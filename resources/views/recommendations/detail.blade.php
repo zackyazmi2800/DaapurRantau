@@ -3,7 +3,6 @@
 @section('content')
 <section class="bg-cream/70 py-10 sm:py-14">
     <div class="page-container"><a href="{{ isset($saved) ? route('favorites.index') : route('recommendations.show', $snapshot['id']) }}" class="inline-flex rounded-lg text-sm font-semibold text-primary hover:underline">← {{ isset($saved) ? 'Kembali ke Favorit' : 'Kembali ke Rekomendasi' }}</a>
-        <x-recipe-image :image="$recipe['image'] ?? null" :large="true" class="mt-8 max-w-3xl" />
         <div class="mt-8">@if(isset($saved))<span class="text-sm font-bold text-primary">Resep Favoritmu</span><p class="mt-2 text-sm text-muted">Ketersediaan bahan belum diperiksa untuk resep tersimpan ini.</p>@else<x-match-badge :match="$recipe['match']" />@endif</div>
         <h1 class="section-title max-w-3xl break-words sm:text-5xl">{{ $recipe['title'] }}</h1>
         <p class="mt-5 max-w-2xl leading-8 break-words text-muted">{{ $recipe['description'] }}</p>

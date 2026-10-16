@@ -1,6 +1,7 @@
 @props(['checklist', 'snapshot'])
-<form method="POST" action="{{ route('recommendations.alternatives', $snapshot['id']) }}" data-ingredient-checklist data-save-url="{{ route('recommendations.checklist', $snapshot['id']) }}">
+<form data-recommendation-operation method="POST" action="{{ route('recommendations.alternatives', $snapshot['id']) }}" data-ingredient-checklist data-save-url="{{ route('recommendations.checklist', $snapshot['id']) }}">
     @csrf
+    <input type="hidden" name="idempotency_key" value="{{ \App\Support\RecipeMode::strict(['mode' => old('mode')]) && is_string(old('idempotency_key')) && \Illuminate\Support\Str::isUuid(old('idempotency_key')) ? old('idempotency_key') : (string) \Illuminate\Support\Str::uuid() }}">
     <p class="mt-3 text-sm leading-6 text-muted">Centang hanya bahan yang benar-benar kamu punya. Kecukupan takaran tetap perlu diperiksa karena jumlah stok belum dicatat.</p>
     @foreach (['Bahan wajib' => false, 'Bahan opsional' => true] as $heading => $optional)
         <h3 class="mt-6 font-bold">{{ $heading }}</h3>

@@ -1,3 +1,5 @@
+> Catatan historis: bagian gambar/Unsplash pada laporan ini sudah tidak berlaku; resep kini ditampilkan tanpa gambar.
+
 # Step 8.6 — checklist dan menu tanpa bahan tambahan
 
 Implementasi 11 Oktober 2026. Tidak melanjutkan Step 9.

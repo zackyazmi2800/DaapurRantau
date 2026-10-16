@@ -981,3 +981,32 @@ GeminiRecipeService kini mencatat path schema dan jumlah/minimum/maksimum secara
 File berubah: app/Services/GeminiRecipeService.php, tests/Feature/GeminiCategoryRepairTest.php, PROGRESS.md. Pint lulus. Pengujian terbatas GeminiCategoryRepairTest dan GeminiRecipeServiceTest: 31 tes / 203 assertions lulus. Skenario simulasi empat langkah membuktikan repair struktur dan cache hasil valid; bukan bukti field yang salah pada respons live sebelumnya. Tidak menjalankan full suite, build, atau API sungguhan.
 
 Manual berikut: kirim satu pencarian dari browser. Jika tetap gagal, periksa log gemini.structure_validation untuk field/jumlah aktual dan metrik kegagalan terbaru. Keberhasilan live setelah perbaikan belum diverifikasi; koneksi timeout masih dapat terjadi. Tidak lanjut tahap berikutnya.
+
+## Step 9 — Persiapan deployment — 12 Oktober 2026
+
+Selesai: audit konfigurasi environment/database/session/cache, migration, middleware/routes, service API dan aset. .env.example diberi petunjuk production dan opsi HttpOnly/SameSite tanpa mengubah .env lokal. DEPLOYMENT.md memuat kebutuhan runtime, clone/install/build, konfigurasi secret, APP_KEY instalasi baru, SQLite persisten, backup/migration, public web root/HTTPS/proxy/permission, optimasi, pemeriksaan, update dan rollback. Driver/model/provider, fitur serta algoritma rekomendasi tidak berubah.
+
+Verifikasi: composer check-platform-reqs --no-dev lulus pada PHP lokal 8.3.13; npm run build lulus (Node lokal22, CSS57.60kB/JS9.60kB). config:cache, route:cache, view:cache dan route:list lulus menggunakan path sementara, environment simulasi production dan API key kosong; cache lokal tidak dihapus. QualityAssuranceTest yang sudah ada:3tes39assertions lulus. Tidak ada tes baru/fullsuite/API live. Referensi key API tidak ditemukan di resources/public build. git diff --check lulus. Pemeriksaan HTTP localhost:8000 tidak terhubung (HTTP000 dari lingkungan tool); browser/responsivitas tidak diuji ulang, UI tidak berubah.
+
+File: .env.example, DEPLOYMENT.md, PROGRESS.md; artefak build lokal diabaikan Git. Belum deploy/commit/push, tidak ada migration pada DB development/production, tidak mengubah secret. Kesiapan server belum dibuktikan: hosting/domain, disk persisten/database, HTTPS/trusted proxy, timeout sinkron, backup dan release perlu keputusan pengguna. Manual berikut: ikuti checklist DEPLOYMENT.md setelah target disepakati; uji localhost dengan server aktif, cek homepage/chips/favorit/riwayat tanpa submit AI; live smoke test menunggu izin. Masalah provider timeout/struktur dari tahap sebelumnya masih memerlukan verifikasi live terpisah, tidak diklaim selesai melalui persiapan deployment.
+
+## Bug mode STRICT terbawa ke Cari Ide — 13 Oktober 2026
+
+Penyebab: edit snapshot dan ulang riwayat memulihkan mode STRICT melalui old input; Blade menerbitkan hidden mode tersebut dan batas105; GenerateRecipeRequest menerima mode dari browser. Cache sudah memasukkan mode dalam hash, bukan sumber bug.
+
+Perbaikan: GenerateRecipeRequest menetapkan NORMAL sebelum validasi dan batas15, mengabaikan pilihan mode klien termasuk nilai tidak valid. Endpoint alternatif tetap menetapkan STRICT dari checklist server. Edit/ulang riwayat memulihkan bahan/opsi dengan modeNORMAL tanpa mengubah snapshot/history asli. Hidden mode di form utama dihapus; batas15 konsisten dan JS menahan submit daftar pemulihan >15 dengan pesan untuk mengurangi bahan, tanpa menghapus bahan otomatis. Tidak menghapus session/cache atau mengubah kategori, provider, favorit, checklist, panduan memasak, maupun persiapan deployment.
+
+File: app/Http/Requests/GenerateRecipeRequest.php; app/Http/Controllers/RecommendationController.php dan HistoryController.php; resources/views/components/ingredient-input.blade.php; resources/js/ingredient-input.js; tests/Feature/AvailableRecipesTest.php; PROGRESS.md. Artefak public/build diperbarui lokal (ignored Git).
+
+Verifikasi:25tes195assertions lulus (AvailableRecipesTest, GenerateRecipeTest, RecipeCacheKeyTest), Pint dan git diff --check lulus, npm run build lulus. Kesalahan awal penempatan fixture test diperbaiki sebelum rerun. Regresi meliputi normal→strict→edit/history→normal3unik, cache tanpa request tambahan, snapshotdetail kedua mode tetap dapat diakses, strict0–3 melalui endpointchecklist dan modeklien tak dipercaya. Browser localhost berhasil membuka form normal batas15; alur API penuh tidak diuji live. Tidak API sungguhan/fullsuite/deploy/commit/push.
+
+Manual pengguna: Cari Ide → Lihat Resep → konfirmasi checklist → Cari Menu dari Bahan yang Ada → Ubah Bahan → ubah daftar → Cari Ide. Hasil sukses terakhir harus3resep/kategoriNORMAL; strict sebelumnya tetap dapat dibuka. Bila bahan yang dipulihkan >15, kurangi pilihan sebelum Cari Ide. Kegagalan provider/kuota masih mungkin; perbaikan ini tidak menjamin live API selalu berhasil. Step9.5 ditunda.
+
+
+## Penghapusan integrasi Unsplash dan gambar resep — 15 Oktober 2026
+
+Source rekomendasi kini langsung menyiapkan snapshot setelah Gemini/ranking tanpa pengambilan gambar. Service gambar, komponen Blade, JavaScript fallback, placeholder SVG serta empat file test gambar dan fixture khusus Unsplash dihapus. Konfigurasi dan .env.example dibersihkan; .env pribadi tidak diubah. Kartu rekomendasi/favorit dan detail hanya memakai informasi teks; checklist, panduan memasak dan seluruh kategori tetap dipertahankan. Riwayat sebelumnya sudah tanpa gambar.
+
+SavedRecipeService tidak menyertakan metadata gambar pada favorit baru; fingerprint tetap sama. Data gambar lama, cache, favorit dan riwayat tidak dihapus atau dimigrasi. Tidak ada dependency khusus Unsplash. README, arsitektur dan panduan deployment diperbarui; laporan Unsplash lama diberi penanda arsip.
+
+Belum menjalankan build, pengujian otomatis/manual, migration atau deployment sesuai batas tugas. Berikutnya: build frontend dan pengujian terisolasi alur rekomendasi normal/alternatif, detail/checklist/panduan, favorit lama/baru, riwayat, kuota/idempotensi dan verifikasi tidak ada request gambar eksternal. Pemilik dapat menghapus variabel UNSPLASH_* serta RECIPE_IMAGE_* sendiri dari .env; aplikasi tidak lagi membacanya.

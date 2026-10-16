@@ -20,6 +20,8 @@ class GenerateRecipeRequest extends FormRequest
         $ingredients = $this->input('ingredients');
 
         $this->merge([
+            // This endpoint is always Cari Ide; strict searches use the checklist endpoint.
+            'mode' => RecipeMode::NORMAL,
             'ingredients' => is_array($ingredients)
                 ? array_map(fn ($value) => is_string($value) ? app(RecipeMatchingService::class)->normalize($value) : $value, $ingredients)
                 : $ingredients,
@@ -30,8 +32,8 @@ class GenerateRecipeRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'mode' => ['sometimes', Rule::in([RecipeMode::NORMAL, RecipeMode::STRICT])],
-            'ingredients' => ['required', 'array', 'list', 'min:1', 'max:'.($this->input('mode') === RecipeMode::STRICT ? 105 : 15)],
+            'mode' => ['sometimes', Rule::in([RecipeMode::NORMAL])],
+            'ingredients' => ['required', 'array', 'list', 'min:1', 'max:15'],
             'ingredients.*' => ['bail', 'required', 'string', 'max:60', 'distinct:strict', "regex:/\A[\pL\pM\pN .’'()\-]+\z/u"],
             'servings' => ['nullable', 'integer', 'between:1,10'],
             'preference' => ['nullable', Rule::in(['bebas', 'hemat', 'cepat', 'pedas'])],
@@ -47,7 +49,7 @@ class GenerateRecipeRequest extends FormRequest
             'ingredients.array' => 'Daftar bahan harus berupa array.',
             'ingredients.list' => 'Format daftar bahan tidak valid.',
             'ingredients.min' => 'Masukkan minimal satu bahan makanan.',
-            'ingredients.max' => 'Maksimal '.($this->input('mode') === RecipeMode::STRICT ? 105 : 15).' bahan makanan boleh dipilih.',
+            'ingredients.max' => 'Maksimal 15 bahan makanan boleh dipilih.',
             'ingredients.*.required' => 'Nama bahan tidak boleh kosong.',
             'ingredients.*.string' => 'Setiap nama bahan harus berupa teks.',
             'ingredients.*.max' => 'Nama bahan maksimal 60 karakter.',

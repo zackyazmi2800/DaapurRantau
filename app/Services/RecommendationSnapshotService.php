@@ -10,26 +10,43 @@ use Illuminate\Support\Str;
 
 class RecommendationSnapshotService
 {
-    public function __construct(private RecipeMatchingService $matching) {}
+    public function __construct(private RecipeMatchingService $matching, private RecommendationOperationService $operations, private \Illuminate\Http\Request $request) {}
 
     public function create(Session $session, array $input, array $recipes, string $message): array
     {
         if (! $session->has('recommendation_owner')) {
             $session->put('recommendation_owner', Str::random(64));
         }
+        $snapshot = $this->prepare($input, $recipes, $message);
+        $id = $snapshot['id'];
+        $snapshot['owner'] = hash('sha256', $session->get('recommendation_owner'));
+        $snapshot['expires_at'] = now()->addHour()->timestamp;
+        Cache::put('recommendation-snapshot:'.$id, $snapshot, 3600);
+
+        return $snapshot;
+    }
+
+    public function prepare(array $input, array $recipes, string $message): array
+    {
         $id = (string) Str::uuid();
-        $snapshot = ['matching_version' => '2', 'id' => $id, 'owner' => hash('sha256', $session->get('recommendation_owner')),
-            'input' => $input, 'message' => $message, 'recipes' => [], 'expires_at' => now()->addHour()->timestamp];
+        $snapshot = ['matching_version' => '2', 'id' => $id,
+            'input' => $input, 'message' => $message, 'recipes' => [], 'expires_at' => now()->addDay()->timestamp];
         foreach ($recipes as $recipe) {
             $snapshot['recipes'][] = ['id' => (string) Str::uuid()] + $recipe;
         }
-        Cache::put('recommendation-snapshot:'.$id, $snapshot, 3600);
 
         return $snapshot;
     }
 
     public function find(Session $session, string $id): ?array
     {
+        if (Str::isUuid($id)) {
+            $operation = $this->operations->owned($this->request)->where('result_id', $id)->first();
+            if ($operation) {
+                return $operation->status === 'succeeded' && $operation->result_expires_at->isFuture()
+                    && is_array($operation->result_payload) ? $operation->result_payload : null;
+            }
+        }
         $owner = $session->get('recommendation_owner');
         if (! is_string($owner) || ! Str::isUuid($id)) {
             return null;

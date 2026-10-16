@@ -1,3 +1,5 @@
+> Arsip historis: integrasi Unsplash dan gambar resep telah dihapus. Instruksi konfigurasi/pengujian di bawah tidak berlaku untuk source saat ini.
+
 # Laporan live Unsplash — satu batch tiga request
 
 Request asli menggunakan RecipeImageService/Http::pool; Gemini tidak dipanggil. Cache dilewati dengan invalidasi hanya tiga key gambar. Environment local, key terbaca boolean, database cache.

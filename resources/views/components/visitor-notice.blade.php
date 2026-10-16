@@ -1,1 +1,1 @@
-<p class="mt-5 max-w-2xl text-sm leading-7 text-muted">Data ini terkait dengan sesi browsermu. Jika sesi hilang, browser berganti, atau cookie dihapus, data mungkin tidak dapat diakses kembali. Favorit belum tersinkronisasi antarperangkat.</p>
+<p class="mt-5 max-w-2xl text-sm leading-7 text-muted">Tanpa akun, kamu bisa mencari resep hingga 3 kali berhasil, tetapi belum bisa menyimpan favorit atau riwayat. Masuk dengan email atau Google untuk menyimpan favorit dan riwayat pencarian di akunmu.</p>

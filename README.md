@@ -7,7 +7,7 @@ Platform ide masakan praktis dan hemat untuk mahasiswa, anak kos, dan perantau. 
 - Landing page dan input chip bahan (1–15), porsi, preferensi dan bahan yang dihindari.
 - Rekomendasi JSON tervalidasi, pencocokan bahan deterministik, urutan resep paling sesuai, detail dengan checkbox bahan/langkah.
 - Cache Gemini 24 jam, snapshot halaman privat 60 menit, limiter dan proteksi concurrent request.
-- Foto ilustrasi Unsplash atau placeholder, atribusi, cache metadata gambar7hari dan hasil tidak ditemukan1jam. Detail/favorit memakai metadata tersimpan tanpa pencarian ulang.
+- Kartu rekomendasi, detail dan favorit berbasis teks tanpa gambar resep atau layanan gambar eksternal.
 - Favorit dari snapshot server, deduplikasi per pengunjung, detail database tanpa Gemini.
 - Riwayat 30 pencarian terakhir, termasuk cache hit; ulang input, hapus satu/semua dengan konfirmasi.
 - Blade responsif, CSRF, escaping output, pembatasan kepemilikan dan error berbahasa Indonesia.
@@ -172,19 +172,30 @@ Aplikasi lulus QA lokal dan siap dipersiapkan untuk staging. Sebelum deployment:
 Deployment, pengujian MySQL, konfigurasi infrastruktur, load test dan audit penetrasi independen belum dilakukan. Mode lokal tetap APP_ENV=local/APP_DEBUG=true; itu bukan konfigurasi production.
 
 
-## Gambar makanan (Step 8.5B)
+## Resep tanpa gambar
 
-Konfigurasi dan smoke test terbatas ada di [docs/UNSPLASH_SETUP.md](docs/UNSPLASH_SETUP.md). Pembuatan aplikasi Unsplash dan Access Key dilakukan manual oleh pemilik. Tambahkan variabel UNSPLASH_* dan RECIPE_IMAGE_* dari .env.example ke .env tanpa mengganti konfigurasi Gemini. Tanpa key, rekomendasi tetap berfungsi dengan placeholder.
+Integrasi Unsplash telah dihapus. Setelah Gemini dan pengurutan resep selesai, aplikasi langsung menyiapkan snapshot tanpa pencarian gambar. Kartu, detail, favorit dan riwayat tidak menampilkan gambar atau placeholder resep. Checklist, panduan memasak, kategori dan tombol aksi tetap tersedia.
 
-RecipeImageService berjalan setelah validasi tiga kategori. Cache gambar terpisah dan metadata ikut snapshot/favorit JSON; tidak perlu migration. Gambar tidak menjadi bagian fingerprint resep. Foto ditampilkan lewat hotlink resmi dengan atribusi, tidak diunduh ke server. Tidak ada request gambar pada GET detail/favorit. Nama populer dan variasinya dipetakan berdasarkan keluarga masakan; metadata meragukan menghasilkan placeholder. Aturan kategori dan Gemini tidak berubah.
+Metadata gambar dalam snapshot/favorit lama dibiarkan tersimpan dan diabaikan oleh tampilan. Fingerprint favorit tetap berdasarkan isi resep. Tidak diperlukan migration atau penghapusan cache/data lama. Gambar hero lokal dan aset identitas visual tetap digunakan.
 
-Pencarian gambar kini memakai `getImagesForRecipes` dengan `Http::pool(concurrency: 3)`: hanya cache miss yang dikirim, maksimal tiga judul per batch. Metadata dipasangkan sesuai urutan resep. Kegagalan satu request tidak membuang foto lainnya; error sementara menggunakan negative cache singkat per judul. Batas kuota dan cooldown tetap berlaku untuk batch berikutnya.
-
-Pencarian gambar bertahap berlaku untuk semua judul: nama lengkap → nama lebih pendek (bila identitas hidangan tetap terjaga) → jenis masakan → padanan Inggris yang tersedia. Maksimal lima query unik per judul; berhenti saat foto relevan ditemukan. Contoh nasi goreng ayam pedas → nasi goreng ayam → nasi goreng → fried rice. Nama belum dikenal tetap dicari dengan penyederhanaan hingga dua kata; tidak menebak terjemahan atau memanggil Gemini untuk foto.
-
-Cache foto sejenis dipisahkan berdasarkan keluarga masakan, sehingga foto nasi goreng tidak dipakai untuk mi goreng. Judul yang belum memiliki pemetaan keluarga hanya memakai cache judulnya sendiri. Cache gambar versi8 dan cache keluarga versi2 mengisolasi strategi lama tanpa flush. Kuota/cooldown/error tetap menghentikan pencarian tambahan. Snapshot/favorit lama tetap memakai metadata tersimpan.
-
+Variabel `UNSPLASH_*` dan `RECIPE_IMAGE_*` tidak lagi dibaca aplikasi; pemilik dapat menghapusnya sendiri dari `.env`. Dokumen `docs/UNSPLASH_*.md` merupakan arsip historis, bukan panduan integrasi aktif.
 
 ## Step 8.6 — bahan terkonfirmasi dan menu strict
 
-Detail resep kini memiliki checklist otomatis berdasarkan stok awal. Perubahan disimpan per alur pencarian, tanpa memanggil Gemini. Tombol Cari Menu dari Bahan yang Ada mengirim hanya bahan yang dicentang ke mode STRICT_AVAILABLE_INGREDIENTS; backend menyaring resep dengan tambahan wajib dan menampilkan0–3hasil valid. Mode normal tetap tiga resep diurutkan tanpa kuota tambahan. Cache dibedakan per mode (prompt6/schema4); favorit, riwayat dan gambar memakai layanan lama. Takaran stok belum dicatat. Rincian dan daftar file ada di [docs/STEP_8_6.md](docs/STEP_8_6.md).
+Detail resep kini memiliki checklist otomatis berdasarkan stok awal. Perubahan disimpan per alur pencarian, tanpa memanggil Gemini. Tombol Cari Menu dari Bahan yang Ada mengirim hanya bahan yang dicentang ke mode STRICT_AVAILABLE_INGREDIENTS; backend menyaring resep dengan tambahan wajib dan menampilkan0–3hasil valid. Mode normal tetap tiga resep diurutkan tanpa kuota tambahan. Cache dibedakan per mode (prompt6/schema4); favorit dan riwayat mempertahankan layanan yang ada. Takaran stok belum dicatat. Rincian dan daftar file ada di [docs/STEP_8_6.md](docs/STEP_8_6.md).
+
+## Login Google (Socialite 5.31.0)
+
+Source tersedia, tetapi belum diuji melalui OAuth asli. Tanpa konfigurasi lengkap tombol Google tetap nonaktif. Email/password + OTP tetap menjadi metode terpisah; akun Google tidak otomatis digabung berdasarkan email dan tidak dapat memakai reset password lokal. Account linking terautentikasi belum tersedia: jika email sudah dipakai, masuk dengan metode sebelumnya.
+
+Persiapan manual Google Cloud Console:
+
+1. Pilih project milik sendiri, siapkan Google Auth Platform / consent screen (nama aplikasi, email dukungan, audience). Jika masih berstatus Testing, daftarkan akun penguji pada Test users.
+2. Buat OAuth Client tipe **Web application**. Gunakan scope `openid`, `email`, dan `profile`; tidak perlu scope Gmail atau akses offline.
+3. Tambahkan **Authorized redirect URI** yang cocok persis, misalnya `http://127.0.0.1:8000/auth/google/callback`. Jangan mengganti `127.0.0.1` dengan `localhost` di tengah alur. Path, scheme, host, port dan trailing slash harus konsisten. Login server-side ini tidak memerlukan Google JavaScript SDK.
+4. Isi `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, dan `GOOGLE_REDIRECT_URI` sendiri dalam `.env` lokal. Jangan commit secret. `APP_URL` harus menggunakan origin yang sama dengan redirect URI (contoh `http://127.0.0.1:8000`). Source tidak mengubah `.env` otomatis.
+5. Jika konfigurasi pernah di-cache, bersihkan/perbarui config cache pada tahap penerapan yang disetujui. Di production wajib HTTPS; HTTP hanya diizinkan pada loopback lokal. Cookie session harus mendukung redirect balik (`SameSite=Lax`), HttpOnly, serta Secure pada HTTPS. Jangan merekam query callback, authorization code, atau token pada access/debug log.
+
+Route masuk: `GET /auth/google/redirect`. Route callback: `GET /auth/google/callback`. State session hanya berlaku 10 menit dan dikonsumsi Socialite; tidak menggunakan `stateless()`. GoogleProvider menukar code dan mengambil userinfo melalui HTTPS. Backend memeriksa subject, email, dan `email_verified === true`; data identitas dari browser tidak dipakai. Access/refresh token tidak disimpan. Transaksi menyimpan user terverifikasi beserta `social_accounts(provider, provider_subject, user_id)` dengan unique constraint yang sudah ada. Session diregenerasi; cookie dan ledger kuota guest tetap dipertahankan.
+
+Tombol aktif hanya membuktikan konfigurasi lokal memenuhi pemeriksaan bentuk/origin, **bukan** membuktikan Client Secret diterima Google. Setelah mendapat izin pengujian, verifikasi login baru/ulang, penolakan email bentrok, state salah/kedaluwarsa, pembatalan consent, logout, dan isolasi favorit/riwayat. Gunakan pengujian terisolasi untuk skenario race sebelum penggunaan production.

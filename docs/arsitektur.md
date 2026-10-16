@@ -152,87 +152,20 @@ Card menampilkan category, jumlah dan daftar tambahan. Detail snapshot menggunak
 Kegagalan kategori menghasilkan503 dan pesan belum dapat melengkapi tiga tingkat kesesuaian, meminta tambah/ubah bahan. Tidak ada request perbaikan otomatis; batas retry transport lama tetap. Model, endpoint, schema structured output, output token dan safety checks tetap. Realisme/keperluan bahan serta alergen turunan tidak dapat dibuktikan sempurna melalui pemeriksaan nama deterministik; instruksi AI dan peringatan UI tetap diperlukan.
 
 
-## Step 8.5B — Foto ilustrasi terpisah dari Gemini
-
-POST RecommendationController menerima DI RecipeImageService dan menambahkan recipe.image sesudah rank/validasi tiga kategori, sebelum snapshot/history. Service tidak mengubah jumlah, kategori atau isi resep. Schema dan cache Gemini tetap; gambar hanya menjadi tambahan output aplikasi. Tidak ada HTTP di Controller/Blade, hanya pemanggilan service. Komponen Blade recipe-image memakai forDisplay yang murni memvalidasi metadata, tanpa I/O jaringan.
-
-RecipeImageService: normalisasi nama → mapping lokal terkurasi (saat ini kosong) → cache metadata → pemeriksaan key/config/budget/lock → GET Unsplash search/photos → pemeriksaan frasa metadata, URL HTTPS host resmi dan atribusi → metadata/placeholder. Mapping terjemahan exact tidak mengubah judul tak dikenal. Metadata memuat image_url regular, image_small_url, image_alt Indonesia, image_source, photographer_name/url, photo_url dan unsplash_photo_id. URL gambar berasal dari API, query/ixid dipertahankan; tautan atribusi ditambah UTM.
-
-Cache recipe-image versi1 SHA256nama terpisah dari Gemini, TTL7hari/negatif1jam. Global lock perkey dan budget45/jam mengurangi request bersamaan; remaining<=2/429 membuat cooldown minimal1jam (Retry-After lebih lama dihormati), auth1jam, errorlain60detik. Tidak retry gambar. Semua kegagalan gambar/cache kembali placeholder tanpa menggagalkan rekomendasi. Log hanya statusHTTP dan angka rate limit, bukan key/query/rawresponse. Request serial maksimal3 perhasil cachemiss, masing-masing timeout maksimal10detik.
-
-Snapshot menyimpan metadata sehingga GET hasil/detail tidak melakukan pencarian. SavedRecipeService menyimpan image dalam recipe_data JSON yang ada, tetapi fingerprint tetap hanya isi resep untuk menjaga favorit lama/deduplikasi. Tidak ada migration dan favorit lama tanpa image memakai placeholder. Komponen gambar dipakai ulang pada card/detail/favorit, aspect4:3, lazy untukcard, eager detail, kredit dan label ilustrasi. JS mengganti gambar yang gagal satu kali tanpa innerHTML dan menyembunyikan kredit foto yang tidak tampil. Placeholder SVG lokal bukan gambar AI atau foto terkurasi.
-
-Penggunaan Unsplash untuk tampilan foto, bukan pemilih/downloadfoto. Fitur download/pemilihan foto kelak wajib mengevaluasi download tracking; tidak ada fitur tersebut sekarang. Setup, batas relevansi berbasis metadata, limit dan contoh satu smoke test di docs/UNSPLASH_SETUP.md. Tidak mengubah algoritma RecipeMatchingService, GeminiRecipeService, konfigurasi Gemini, navbar/footer/landing atau deployment.
-
-
-### Debugging gambar — strategi relevansi versi2
-
-Frasa judul lengkap sebelumnya menolak metadata relevan dengan urutan berbeda atau tanpa modifier (contoh fried rice with egg vs egg fried rice). selectRelevantImage kini menilai seluruh kandidat valid: identitas hidangan berdasarkan keluarga/alias terkontrol wajib ada, modifier menaikkan skor, kandidat terbaik dipilih. Batas kata utuh menghindari ricecake/eggplant sebagai rice/egg. Untuk nama tak dikenal, minimal2token bermakna dan coverage75%; metadata generik food/plate tidak otomatis diterima. URL/atribusi tetap divalidasi, foto lokal tetapprioritas dan fallback tetapada. Versi keygambar2 mengisolasi cache negatif strategi1 tanpa flush. TTL7hari/1jam tetap. Snapshot/favorit lama tetap menyimpan image lama; pencarian baru menerapkan strategi baru, GET tidak ditambahkan request jaringan.
-
-
 ## Perbaikan kegagalan kategori Gemini
 
 Log live menunjukkan HTTP200 tetapi invalid_categories. RecipeMatchingService kini memberi diagnostics aman: kind=missing_count_ranges dengan missing_counts terurut, atau kind=combined_ingredient dengan indeks resep. Kriteria penghitungan/rentang tidak berubah. GeminiRecipeService mencatat diagnostics ini tanpa nama bahan, judul, alergi, prompt atau key.
 
 Loop request memakai batas total2panggilan untuk retry transport ATAU satu perbaikan kategori. Hanya invalid_categories pada respons pertama yang sudah lolos struktur, jumlah, duplikasi dan alergi memicu perbaikan. Input tetap bahan/porsi/preferensi/alergi ditambah feedback hitungan/jenis kegagalan; tidak mengirim respons panjang/riwayat percakapan. Meminta set3resep terkoreksi dengan schema yang sama agar kompatibel, tanpa menaikkan tokenlimit. Respons kedua divalidasi penuh; tidak ada panggilan ketiga meski503 atau kategori masih salah. Kuota/timeout/JSONinvalid/truncated/alergi tidak diperbaiki otomatis.
 
-Prompt menegaskan penggunaan nama bahan input yang sama, keterangan pengolahan pada langkah, satu jenis bahan perentri, dan pemeriksaan ulang hitungan sebelum output. Promptversion4/schemaversion3; cachelama terisolasi tanpa flush. Hanya hasil akhir valid disimpan dan dicatat sebagai riwayat; satu pencarian sukses tetap satu snapshot/history. Kebijakan ini menggantikan catatan lama tentang tidak adanya repair kategori. Unsplash tidak diubah.
-
-
-## Parallel fetch Unsplash
-
-Controller memanggil getImagesForRecipes satu kali dengan resep terurut, lalu memasangkan arraymetadata berdasarkan indeks. Service menerima maksimal3, mendahulukan local/cachepositif/cachenegatif perjudul, deduplikasi nama sama, dan memberi keycache sebagai nama request Http::pool(concurrency:3). Hanya cachemiss yang dijadwalkan. getRecipeImage kompatibel sebagai wrapperbatch1 untuktools/setup lama. Algoritmarelevansi dan versikey2 tidak berubah.
-
-Lockglobal kini melindungi batch (bukan satu request), reservasi budget45/jam dilakukan atomik di dalam lock berdasarkan jumlahmiss. Sisaheader tersimpan juga membatasi slot dengan cadangan2; sisa didecrement saatreserve agarheaderhilang tidakmenyebabkan overshoot. Cooldown429/auth berlaku untukbatchberikutnya, seluruh responsbatchsaatini tetapdiproses secara independen. Timeout/exception pool hanya placeholderresepterkait. Error/JSONinvalid negativecache60detik perjudul; quota/auth jedalebihlama, pencariankosong1jam, fotovalid7hari. Tidakretry, tidakflushcache, tidakmengubahGemini/kategori/JSONresep/UI/favorit/history.
-
-Pengujian fakepromise membuktikan3dispatch terjadi sebelumresponsdiselesaikan; responsbalikurutan tetapdipasangkankejudulbenar. Dalam test itu saja, hooktransferstats Http::fake yang melakukan wait sinkron dinonaktifkan untukmenguji penjadwalanpool; produksi memakai middlewarestandar. Tidakadapanggilanproviderlive atau klaimbenchmarklatensi.
-
-
-### Koreksi berdasarkan satu batch live Unsplash
-
-Tiga pencarian HTTP200 membuktikan pool berjalan. Metadata asli Mie Goreng memakai "Mi Goreng Jawa"; alias mi goreng ditambahkan. Kandidat omelette dengan alt soup/quiche ditolak; skor kini menambah dukungan independen alt sehingga kandidat bertuliskan omelet di alt diutamakan. Bukan penerimaan semua foto makanan. Versi cachegambar3 mengisolasi hasil lama. Responslive yang sudahdisimpan diprosesulang offline untukcachebaru, tanpa batchkedua. Controller/Blade/Gemini/kategori tetap. Diagnostik15kandidat di docs/UNSPLASH_LIVE_REPORT.md.
+Prompt menegaskan penggunaan nama bahan input yang sama, keterangan pengolahan pada langkah, satu jenis bahan perentri, dan pemeriksaan ulang hitungan sebelum output. Promptversion4/schemaversion3; cachelama terisolasi tanpa flush. Hanya hasil akhir valid disimpan dan dicatat sebagai riwayat; satu pencarian sukses tetap satu snapshot/history. Kebijakan ini menggantikan catatan lama tentang tidak adanya repair kategori.
 
 
 ## Revisi pengurutan tanpa kuota bahan tambahan
 
 Revisi ini menggantikan ketentuan rentang tambahan pada catatan sebelumnya. RecipeMatchingService tetap mensyaratkan tepat tiga resep unik yang aman, tetapi tidak membatasi minimum/maksimum jumlah bahan tambahan pada setiap peringkat. Pengurutan stabil menaik berdasarkan jumlah bahan wajib unik yang belum tersedia; bahan opsional tidak dihitung. Badge kategori merupakan peringkat relatif. Semua resep boleh memiliki nol tambahan atau jumlah tambahan yang sama.
 
-Prompt Gemini versi 5 meminta bahan tambahan sesedikit mungkin tanpa memaksakan kuota. Cache berversi mengisolasi hasil prompt lama tanpa menghapus cache pengguna. Koreksi semantik satu kali hanya untuk nama bahan gabungan (invalid_ingredient_names), bukan jumlah tambahan; batas total dua request tetap berlaku. Controller, Unsplash, tampilan, snapshot, favorit, dan riwayat mempertahankan alur yang ada.
-
-
-## Perbaikan pencarian foto variasi judul
-
-RecipeImageService versi cache 4 menggunakan keluarga masakan yang sama untuk pencarian dan validasi relevansi. Alias omelet/omelette/telur dadar dan mi/mie goreng dikenali pada judul maupun metadata. Sup tahu dan sup seafood menggunakan query Inggris yang terkontrol; modifier tahu/bayam/seafood/sayur membantu pencarian dan penilaian. Kata dekoratif judul tidak ikut query keluarga yang dikenali. Judul tak dikenal tetap dipertahankan. HTTP 200 belum berarti ada foto relevan: log unsplash.selection kini mencatat selected/no_relevant_photo dan jumlah kandidat tanpa body atau key.
-
-Negative cache versi lama tidak menutupi strategi baru. Snapshot/favorit lama tidak ditulis ulang dan GET tetap tidak melakukan pencarian API. Semua batas pool, budget, cooldown dan validasi URL/atribusi tetap berlaku. Foto belum tentu tersedia untuk setiap masakan; placeholder tetap dipakai ketika metadata tidak cukup.
-
-
-Revisi 10 Oktober 2026: cache gambar versi5, pengenalan sayur bening/tumis tahu dan kata inti sup tahu yang tidak harus bersebelahan. Noodle soup tetap ditolak untuk sup sayur/tahu. Log kandidat memakai enum alasan aman. Bukti respons asli dan hasil browser ada di docs/UNSPLASH_DEBUG_2026-10-10.md. Satu foto nyata dimuat, dua kandidat lama tidak relevan; query baru belum diuji live.
-
-
-## Urutan pencarian telur dadar — 10 Oktober 2026
-
-Sesuai urutan pengguna, variasi judul berawalan telur dadar dicari dengan kata Indonesia asli: nama lengkap → hapus kata terakhir → telur dadar. Contoh: telur dadar wortel tahu → telur dadar wortel → telur dadar. Query duplikat dihapus, maksimal tiga tahap. Keluarga masakan lain mempertahankan strategi sebelumnya.
-
-Tahap berikutnya hanya berjalan setelah respons sukses dengan results valid tetapi tanpa foto relevan. Berhenti saat foto ditemukan; error HTTP/koneksi/JSON tidak memicu perluasan. Tiap tahap menjalankan resep yang masih belum memperoleh foto secara paralel (maksimal3), jadi batas terburuk9 pencarian untuk3 variasi, bukan3 total. Budget45/jam, cadangan quota2 dan cooldown diperiksa kembali setiap tahap. Lock45detik meliputi maksimal3 tahap timeout10detik. URL, atribusi dan relevansi tetap divalidasi. Tidak ada query tambahan di GET detail/favorit.
-
-Cache gambar versi6 menyimpan hasil akhir; placeholder tahap sementara tidak disimpan sebagai hasil akhir. Jika budget/cooldown menghentikan proses, placeholder tetap ditampilkan dan proteksi tidak dilewati. Cache Gemini/snapshot lama tidak dihapus. Tidak ada request live pada perubahan ini.
-
-
-## Foto sejenis Unsplash — 10 Oktober 2026
-
-Urutan variasi telur dadar kini: nama lengkap → hapus kata terakhir → telur dadar → vegetable omelette → omelette. Query duplikat dihapus (judul tiga kata memiliki empat tahap). Tahap berhenti ketika foto valid ditemukan. Relevansi tetap mensyaratkan identitas omelette dan menolak konflik seperti soup/quiche; tidak wajib seluruh bahan tambahan terlihat. Label ilustrasi dan atribusi tetap memakai komponen yang ada.
-
-Cache khusus gambar versi7; cache sejenis recipe-image-similar:1:omelette menyimpan metadata foto Unsplash yang sudah tervalidasi dengan TTL gambar. Lookup mendahulukan hasil perjudul, lalu foto sejenis untuk keluarga telur dadar, sebelum HTTP. Alt disesuaikan dengan judul tujuan; URL/atribusi asli dipertahankan. Foto telur tidak dipakai untuk keluarga nasi/sup. Negative cache perjudul tetap dihormati sampai kedaluwarsa; tidak flush Gemini atau snapshot/favorit.
-
-Maksimal5 tahap perjudul (15 request untuk3 judul pada kondisi terburuk),3 request paralel per tahap. Budget45/jam dan cadangan2 tetap dicek tiap tahap; cooldown/error HTTP/koneksi/JSON menghentikan perluasan. Lock gambar65detik mencakup5 tahap timeout10detik. Jumlah request aktual berhenti lebih awal saat cachehit/fotosukses/kuota. Tidak ada request live dalam perubahan ini; tidak menjamin provider selalu tersedia.
-
-
-## Pencarian bertahap seluruh judul — 10 Oktober 2026
-
-Menggantikan batas lingkup telur dadar: buildSearchQueries menerima semua judul, selalu mulai dari nama asli ternormalisasi. Selanjutnya nama tanpa kata terakhir (hanya jika keluarga masakan tidak berubah), nama keluarga, dan padanan Inggris terkontrol. Maksimal5 query unik. Telur dadar tetap mempertahankan vegetable omelette → omelette. Nasi goreng, mi, sup, tumis, ayam goreng/bakar, ikan goreng, telur kukus, bakwan, perkedel, capcay, soto, sate, rendang memiliki pemetaan. Nama tak dikenal menggunakan nama lengkap → hapus kata terakhir → dua kata pertama; judul satu kata tetap dicari. Tidak menjanjikan terjemahan semua kata atau menebak bahasa Inggris via Gemini. Filter nama tak dikenal memerlukan kata inti pada metadata; keluarga dikenal memerlukan identitas hidangan sesuai alias.
-
-Cache foto versi8, cache keluarga versi2 berdasarkan hash keluarga, terisolasi antarkeluarga. Nama tak dikenal tidak berbagi cache sejenis. Cache Gemini/snapshot/favorit tidak dihapus. Batas5 tahap/15request terburuk, pool3, lock65detik, budget45/jam, cadangan2, cooldown dan stop pada error tetap. Contoh sup ... tahu tidak disederhanakan menjadi sup ... tanpa tahu karena identitas berubah. Foto tetap ilustrasi, tidak menjamin seluruh bahan terlihat.
+Prompt Gemini versi 5 meminta bahan tambahan sesedikit mungkin tanpa memaksakan kuota. Cache berversi mengisolasi hasil prompt lama tanpa menghapus cache pengguna. Koreksi semantik satu kali hanya untuk nama bahan gabungan (invalid_ingredient_names), bukan jumlah tambahan; batas total dua request tetap berlaku. Controller, tampilan, snapshot, favorit, dan riwayat mempertahankan alur yang ada.
 
 
 ## Step 8.6 — checklist dan strict
@@ -251,8 +184,16 @@ Gemini normal memprioritaskan kandidat realistis0→1→2. Bila respons awal val
 
 Aturan aktif setelah pembatalan bug fix sebelumnya: Paling Cocok dipilih dengan algoritma semula0→1→2; keluarkan kandidat itu, pilih Cukup dari0–3 dengan urutan3→2→1→0, lalu Alternatif>=4 ascending. Tie-break memakai jumlah bahan wajib tersedia. Semua count bersumber matching backend, bukan urutan provider. Normal tetap3resep unik; jika rentang tidak lengkap, incomplete_categories memicu koreksi maksimal sekali dalam budget total2request, lalu gagal aman bila tetap tidak lengkap. Prompt menegaskan resep realistis dan larangan manipulasi bahan.
 
-Versi khusus cache normal category-priority-3; strict/schema/model/Unsplash tetap, tidak flush. Snapshot normal lama dihitung ulang saat GET tanpa provider; data tidak memenuhi rentang ditangani halaman410, bukan badge salah. Card dan detail memakai metadata match yang sama. Favorit/data permanen tidak ditulis ulang.
+Versi khusus cache normal category-priority-3; strict/schema/model tetap, tidak flush. Snapshot normal lama dihitung ulang saat GET tanpa provider; data tidak memenuhi rentang ditangani halaman410, bukan badge salah. Card dan detail memakai metadata match yang sama. Favorit/data permanen tidak ditulis ulang.
 
 ## Fallback Alternatif Menu — 12 Oktober 2026
 
-Alternatif memilih kandidat sisa setelah Paling/Cukup: prioritas>=4 ascending, lalu jika tidaktersedia fallback<=3 descending. Service menahan setvalidfallback sebelum satu upaya repair (budgettotal2); setelahbudget/gagalrepair, setvalidtetap bolehditampilkan. Kandidatutama>=4 dari setvalid tidak diganti fallback; penggabungan respons divalidasi ulang untukmencegahduplikasi/alergi/perubahanposisikategoriterpilih. Jika tidakbisa digabung, setlengkapvalid dipertahankan. Normalcache alternative-fallback-4, strict/Unsplash/schema tidakberubah. Tidakmenjaminprovider telahmenjelajahi semuaresep; fallbackberdasarkan kandidat dan upayaterbatas.
+Alternatif memilih kandidat sisa setelah Paling/Cukup: prioritas>=4 ascending, lalu jika tidaktersedia fallback<=3 descending. Service menahan setvalidfallback sebelum satu upaya repair (budgettotal2); setelahbudget/gagalrepair, setvalidtetap bolehditampilkan. Kandidatutama>=4 dari setvalid tidak diganti fallback; penggabungan respons divalidasi ulang untukmencegahduplikasi/alergi/perubahanposisikategoriterpilih. Jika tidakbisa digabung, setlengkapvalid dipertahankan. Normalcache alternative-fallback-4, strict/schema tidakberubah. Tidakmenjaminprovider telahmenjelajahi semuaresep; fallbackberdasarkan kandidat dan upayaterbatas.
+
+## Alur tanpa gambar resep (terkini)
+
+RecipeImageService, konfigurasi Unsplash, komponen gambar dan fallback resep telah dihapus. RecommendationController memanggil Gemini → rank/validasi resep → prepare snapshot → complete operation → redirect hasil, tanpa layanan gambar. Reservasi/komit kuota, idempotensi, prompt, cache Gemini dan aturan kategori tidak berubah.
+
+SavedRecipeService menyimpan isi resep saja untuk favorit baru. Fingerprint tetap berdasarkan field resep yang sama; favorit lama yang memiliki metadata gambar tetap dapat dibaca tanpa modifikasi database. Blade tidak mengakses metadata gambar lama. Detail bersama untuk hasil dan favorit tetap menyediakan checklist serta panduan memasak; riwayat tidak membutuhkan gambar.
+
+Tidak ada pencarian atau pemuatan gambar eksternal pada halaman resep/koleksi. Hero memakai aset lokal. Catatan foto pada laporan tahap lama dan dokumen UNSPLASH_* adalah arsip yang tidak lagi menggambarkan integrasi aktif.

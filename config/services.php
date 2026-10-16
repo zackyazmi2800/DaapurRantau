@@ -14,15 +14,10 @@ return [
     |
     */
 
-    'unsplash' => [
-        'access_key' => env('UNSPLASH_ACCESS_KEY', ''),
-        'base_url' => env('UNSPLASH_BASE_URL', 'https://api.unsplash.com'),
-        'per_page' => (int) env('UNSPLASH_PER_PAGE', 5),
-        'timeout' => (int) env('UNSPLASH_TIMEOUT', 10),
-        'cache_ttl' => (int) env('RECIPE_IMAGE_CACHE_TTL', 604800),
-        'negative_cache_ttl' => (int) env('RECIPE_IMAGE_NEGATIVE_CACHE_TTL', 3600),
-        // Only add verified, licensed local photos; keys are normalized dish names.
-        'local_images' => [],
+    'google' => [
+        'client_id' => env('GOOGLE_CLIENT_ID', ''),
+        'client_secret' => env('GOOGLE_CLIENT_SECRET', ''),
+        'redirect' => env('GOOGLE_REDIRECT_URI', ''),
     ],
 
     'postmark' => [

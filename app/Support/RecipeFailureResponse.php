@@ -12,7 +12,7 @@ class RecipeFailureResponse
         if ($request->expectsJson()) {
             return response()->json(['message' => $message], $status, $headers);
         }
-        $request->session()->flashInput($request->only('ingredients', 'servings', 'preference', 'allergies', 'mode'));
+        $request->session()->flashInput($request->only('ingredients', 'servings', 'preference', 'allergies', 'mode', 'idempotency_key'));
 
         return response()->view('recommendations.error', compact('message'), $status, $headers);
     }

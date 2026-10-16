@@ -20,6 +20,6 @@
     @else
         <div class="rounded-3xl border border-line bg-sage/40 px-6 py-14 text-center"><x-icon name="bowl" class="mx-auto size-12 text-primary" /><h2 class="mx-auto mt-6 max-w-lg text-2xl font-bold">{{ $strict ? 'Belum ada masakan yang bisa dibuat hanya dari bahan ini. Coba tambahkan bahan lain, yuk!' : 'Wah, belum ada resep yang cocok. Coba tambahkan bahan lain, yuk!' }}</h2><x-button href="{{ route('recommendations.edit', $snapshot['id']) }}" class="mt-8">Ubah Bahan</x-button></div>
     @endif
-    <p class="mt-8 max-w-2xl text-sm leading-7 text-muted">Ide masakan dihasilkan AI. Kesesuaian dihitung dari nama bahan, bukan kecukupan takaran. Periksa kembali seluruh bahan, alergi, dan kematangan sebelum dikonsumsi. Hasil tersedia selama 60 menit.</p>
+    <p class="mt-8 max-w-2xl text-sm leading-7 text-muted">Ide masakan dihasilkan AI. Kesesuaian dihitung dari nama bahan, bukan kecukupan takaran. Periksa kembali seluruh bahan, alergi, dan kematangan sebelum dikonsumsi. Hasil tersedia hingga {{ \Illuminate\Support\Carbon::createFromTimestamp($snapshot['expires_at'])->format('d/m/Y H:i') }}.</p>
 </section>
 @endsection

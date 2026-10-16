@@ -29,8 +29,22 @@
 }
 
 @layer components {
+    .toast-card { animation: toast-enter 180ms ease-out; }
+    .toast-card.toast-leaving { animation: toast-exit 180ms ease-in forwards; }
     .page-container { @apply mx-auto w-full max-w-6xl px-5 sm:px-8; }
     .nav-link { @apply rounded-md py-2 transition hover:text-primary; }
     .eyebrow { @apply text-[11px] font-bold tracking-[0.16em] text-primary; }
     .section-title { @apply mt-3 text-3xl leading-tight font-bold tracking-[-0.035em] sm:text-4xl; }
+}
+
+@keyframes toast-enter {
+    from { opacity: 0; transform: translateY(-0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+@keyframes toast-exit {
+    from { opacity: 1; transform: translateY(0); }
+    to { opacity: 0; transform: translateY(-0.5rem); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .toast-card, .toast-card.toast-leaving { animation: none; }
 }

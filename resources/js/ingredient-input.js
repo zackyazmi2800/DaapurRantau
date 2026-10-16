@@ -17,7 +17,14 @@ if (form) {
     let ingredients = [...new Set([...values.querySelectorAll('input')].map((field) => normalize(field.value)))];
     let submitting = false;
 
+    let previousIngredients = JSON.stringify(ingredients);
+
     function render() {
+        const currentIngredients = JSON.stringify(ingredients);
+        if (currentIngredients !== previousIngredients) {
+            form.dispatchEvent(new Event('ingredients-changed'));
+            previousIngredients = currentIngredients;
+        }
         chips.replaceChildren();
         values.replaceChildren();
         form.querySelector('#ingredient-empty').hidden = ingredients.length > 0;
@@ -47,10 +54,15 @@ if (form) {
             remove.setAttribute('aria-label', `Hapus ${ingredient}`);
             remove.addEventListener('click', () => {
                 if (submitting) return;
+                const restoreFocus = document.activeElement === remove;
                 ingredients.splice(index, 1);
                 render();
                 feedback.textContent = `${ingredient} dihapus.`;
-                input.focus();
+                if (restoreFocus) {
+                    const remainingButtons = chips.querySelectorAll('button');
+                    const nextFocus = remainingButtons[Math.min(index, remainingButtons.length - 1)] || chips;
+                    nextFocus.focus({ preventScroll: true });
+                }
             });
             chip.append(label, remove);
             chips.append(chip);
@@ -127,6 +139,12 @@ if (form) {
         if (input.value.trim()) {
             event.preventDefault();
             feedback.textContent = 'Tekan Tambah atau Enter untuk mengonfirmasi bahan yang diketik, atau kosongkan pencarian sebelum mencari resep.';
+            input.focus();
+            return;
+        }
+        if (ingredients.length > ingredientLimit) {
+            event.preventDefault();
+            feedback.textContent = `Maksimal ${ingredientLimit} bahan untuk Cari Ide. Hapus beberapa bahan sebelum melanjutkan.`;
             input.focus();
             return;
         }

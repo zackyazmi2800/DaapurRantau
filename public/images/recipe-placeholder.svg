@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600" role="img" aria-label="Ilustrasi peralatan masak">
-<rect width="800" height="600" fill="#FFF8EB"/><circle cx="400" cy="275" r="160" fill="#E5EEDD"/>
-<g fill="none" stroke="#427A54" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
-<path d="M285 255h230v65a80 80 0 0 1-80 80h-70a80 80 0 0 1-80-80zM285 275h-30v50h30m230-50h30v50h-30M270 255h260M320 230q80-85 160 0M385 195v-15h30v15"/>
-<path d="M355 150q-15-18 0-35m90 35q-15-18 0-35" stroke="#F2A65A"/>
-</g><text x="400" y="495" text-anchor="middle" fill="#25332B" font-family="sans-serif" font-size="26">Foto masakan belum tersedia</text>
-</svg>

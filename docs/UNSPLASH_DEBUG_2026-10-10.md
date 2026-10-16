@@ -1,3 +1,5 @@
+> Arsip historis: integrasi Unsplash dan gambar resep telah dihapus. Instruksi konfigurasi/pengujian di bawah tidak berlaku untuk source saat ini.
+
 # Diagnosis Unsplash — 10 Oktober 2026
 
 ## Bukti dan batas pengujian

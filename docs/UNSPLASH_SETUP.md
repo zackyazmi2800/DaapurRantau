@@ -1,3 +1,5 @@
+> Arsip historis: integrasi Unsplash dan gambar resep telah dihapus. Instruksi konfigurasi/pengujian di bawah tidak berlaku untuk source saat ini.
+
 # Konfigurasi gambar Unsplash — Dapur Rantau
 
 ## Registrasi manual
