@@ -84,7 +84,7 @@ class MidtransSandboxService
 
         // Status and fraud flags are outside the notification signature.
         $current = $this->currentStatus($payment);
-        abort_if($current === null, 503);
+        abort_if($current === null, 503, 'Status pembayaran belum dapat diverifikasi.');
 
         // A delayed notification may differ from the current gateway state.
         $status = $this->paymentStatus($current);
@@ -118,14 +118,14 @@ class MidtransSandboxService
         try {
             $response = $this->client()->get("https://api.sandbox.midtrans.com/v2/{$payment->order_id}/status");
         } catch (ConnectionException) {
-            abort(503);
+            abort(503, 'Status pembayaran belum dapat diverifikasi.');
         }
         $current = $response->json();
         // Snap orders exist at Midtrans only after a payment method is chosen.
         if ($response->status() === 404 || (is_array($current) && ($current['status_code'] ?? null) === '404')) {
             return null;
         }
-        abort_unless($response->successful(), 503);
+        abort_unless($response->successful(), 503, 'Status pembayaran belum dapat diverifikasi.');
         abort_unless(is_array($current) && ($current['order_id'] ?? null) === $payment->order_id
             && $this->matchesAmount($current['gross_amount'] ?? null, $payment->amount)
             && ($current['currency'] ?? 'IDR') === 'IDR', 422);

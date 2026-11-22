@@ -31,12 +31,14 @@ class SqliteContention
 
     public static function response(Request $request): Response
     {
-        $message = 'Penyimpanan sedang sibuk. Tunggu sebentar lalu kirim ulang pencarian yang sama. Jangan membuat pencarian baru.';
+        $message = $request->is('api/midtrans/*', 'langganan', 'langganan/*')
+            ? 'Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.'
+            : 'Penyimpanan sedang sibuk. Tunggu sebentar lalu kirim ulang pencarian yang sama. Jangan membuat pencarian baru.';
         $headers = ['Retry-After' => '2', 'Cache-Control' => 'no-store'];
 
         // Do not render the application layout, read quota, or flash session here:
         // the database/session/cache may itself be the failing component.
-        return $request->expectsJson()
+        return $request->expectsJson() || $request->is('api/*')
             ? response()->json(['message' => $message], 503, $headers)
             : response('<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Penyimpanan sedang sibuk</title><main><h1>Penyimpanan sedang sibuk</h1><p>'.$message.'</p></main></html>', 503, $headers + ['Content-Type' => 'text/html; charset=UTF-8']);
     }
