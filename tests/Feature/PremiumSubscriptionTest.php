@@ -15,6 +15,7 @@ use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
@@ -295,7 +296,7 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertSame([], $reconcile());
 
         $this->travel(11)->minutes();
-        $this->assertEquals(['review' => 1, 'paid' => 1, 'unrecorded' => 1], $reconcile());
+        $this->assertEquals(['unchanged' => 1, 'paid' => 1, 'unrecorded' => 1], $reconcile());
         $this->assertSame(['review', 'paid', 'pending', 'failed', 'expired'], array_map($status, [$review, $lunas, $kosong, $gagal, $lewat]));
         $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-17 00:11:00']);
         $this->assertSame([], $reconcile());
@@ -420,6 +421,81 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertSame(['paid' => 1], $reconcile());
         $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-17 00:22:00']);
         Http::assertNotSent(fn ($request) => ! str_starts_with($request->url(), 'https://api.sandbox.midtrans.com/'));
+        $this->assertSame([], $logged->getArrayCopy());
+    }
+
+    public function test_reconciliation_runs_one_at_a_time_and_reports_only_its_own_changes(): void
+    {
+        $logged = $this->recordLogs();
+        $this->travelTo(Carbon::parse('2026-01-10 00:00 UTC'));
+        $user = User::factory()->create();
+        $weekly = DB::table('subscription_plans')->where('code', 'weekly')->value('id');
+        $payment = function (int $age) use ($user, $weekly) {
+            $order = (string) Str::uuid();
+            DB::table('payments')->insert(['order_id' => $order, 'user_id' => $user->id, 'plan_id' => $weekly, 'amount' => 5000, 'created_at' => now()->subMinutes($age), 'updated_at' => now()->subMinutes($age)]);
+
+            return $order;
+        };
+        [$lunas, $kedaluwarsa, $menunggu, $didahului] = [$payment(30), $payment(31), $payment(32), $payment(33)];
+        $states = [$lunas => ['200', 'settlement'], $kedaluwarsa => ['407', 'expire'], $menunggu => ['201', 'pending'], $didahului => ['200', 'settlement']];
+        Http::fake(function ($request) use (&$states, $didahului) {
+            $order = explode('/', $request->url())[4];
+            $this->assertSame("https://api.sandbox.midtrans.com/v2/{$order}/status", $request->url());
+            if ($order === $didahului) {
+                DB::table('payments')->where('order_id', $order)->update(['status' => 'paid']);
+            }
+
+            return Http::response(['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => $states[$order][0], 'transaction_status' => $states[$order][1], 'fraud_status' => 'accept']);
+        });
+        $reconcile = fn () => app(MidtransSandboxService::class)->reconcile();
+        $rows = fn () => DB::table('payments')->orderBy('id')->get(['status', 'updated_at'])->toJson();
+        $free = fn () => tap(Cache::lock('payments:reconcile', 5)->get(), fn () => Cache::lock('payments:reconcile')->forceRelease());
+
+        $other = Cache::lock('payments:reconcile', 120);
+        $this->assertTrue($other->get());
+        $before = $rows();
+        $this->assertSame(['skipped' => 1], $reconcile());
+        $this->artisan('payments:reconcile')->expectsOutputToContain('skipped=1')->assertSuccessful();
+        $this->artisan('payments:reconcile', ['--order' => $lunas])->expectsOutputToContain('skipped=1')->assertSuccessful();
+        Http::assertNothingSent();
+        $this->assertSame($before, $rows());
+        $this->assertDatabaseCount('subscriptions', 0);
+        $this->assertTrue($other->release());
+
+        $this->assertEquals(['paid' => 1, 'expired' => 1, 'unchanged' => 2], $reconcile());
+        Http::assertSentCount(4);
+        $this->assertSame(['paid', 'expired', 'pending', 'paid'], DB::table('payments')->orderBy('id')->pluck('status')->all());
+        $this->assertDatabaseCount('subscriptions', 1);
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-17 00:00:00']);
+        $this->assertTrue($free());
+        $this->assertSame([], $reconcile());
+        Http::assertSentCount(4);
+
+        $stale = Cache::lock('payments:reconcile', 120);
+        $this->assertTrue($stale->get());
+        $this->travel(119)->seconds();
+        $this->assertSame(['skipped' => 1], $reconcile());
+        $this->travel(2)->seconds();
+        $this->assertSame([], $reconcile());
+        $this->assertTrue($free());
+
+        $this->assertTrue(Cache::lock('payments:reconcile', 120)->get());
+        $states[$menunggu] = ['200', 'settlement'];
+        $this->postJson('/api/midtrans/notification', ['order_id' => $menunggu, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
+            'fraud_status' => 'accept', 'signature_key' => hash('sha512', $menunggu.'2005000.00'.config('midtrans.signature_secret_key'))])->assertOk();
+        $this->actingAs($user)->post('/langganan/status', ['order_id' => $menunggu])->assertSessionHas('status_type', 'success');
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-24 00:00:00']);
+        Cache::lock('payments:reconcile')->forceRelease();
+
+        Schema::rename('payments', 'payments_moved');
+        try {
+            $reconcile();
+            $this->fail('Rekonsiliasi seharusnya gagal tanpa tabel payments.');
+        } catch (QueryException) {
+            $this->assertTrue($free());
+        }
+        Schema::rename('payments_moved', 'payments');
+        $this->assertDatabaseCount('subscriptions', 1);
         $this->assertSame([], $logged->getArrayCopy());
     }
 

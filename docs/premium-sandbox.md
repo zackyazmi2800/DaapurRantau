@@ -36,6 +36,16 @@ php artisan schedule:work
 
 Perintah terjadwal setiap lima menit, tetapi baru berjalan jika `schedule:work` atau cron `schedule:run` dinyalakan. Perintah memakai database pada environment tempat ia dijalankan. Yang diperiksa hanya pembayaran `pending` dan `review` yang berumur minimal 10 menit, paling banyak 20 per putaran, dengan jeda 10 menit (umur di bawah 2 jam) atau 60 menit per pembayaran. Pembayaran `pending` berumur lebih dari 7 hari hanya diperiksa lewat `--order`. Putaran berhenti jika Midtrans gagal tiga kali berturut-turut atau database sedang sibuk.
 
+Hanya satu rekonsiliasi yang berjalan pada satu waktu per database, baik dari scheduler maupun manual: perintah mengambil kunci `payments:reconcile` di cache (berlaku lintas proses, kedaluwarsa sendiri setelah 120 detik jika proses mati). Perintah yang datang saat kunci masih dipegang berhenti dengan `skipped=1` tanpa menghubungi Midtrans. Angka pada keluaran hanya menghitung perubahan yang dilakukan proses itu sendiri:
+
+| Keluaran | Arti |
+| --- | --- |
+| `paid`, `expired`, `failed`, `review` | Pembayaran yang statusnya diubah oleh proses ini. |
+| `unchanged` | Diperiksa, tetapi statusnya tidak berubah atau sudah diubah proses lain (misalnya webhook). |
+| `unrecorded` | Midtrans belum mencatat transaksinya dan umurnya belum 48 jam. |
+| `unverified`, `error` | Tidak dapat diverifikasi ke Midtrans, atau gagal diproses (lihat log). |
+| `skipped`, `busy`, `inactive` | Tidak berjalan: rekonsiliasi lain sedang berjalan, database sibuk, atau Sandbox tidak aktif. |
+
 | Status | Arti |
 | --- | --- |
 | `pending` | Menunggu pembayaran. Jika Midtrans tidak pernah mencatat transaksinya, status menjadi `expired` setelah 48 jam. |

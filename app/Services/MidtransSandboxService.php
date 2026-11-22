@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Support\SqliteContention;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -135,6 +136,23 @@ class MidtransSandboxService
         if (! $this->ready()) {
             return ['inactive' => 1];
         }
+        $lock = Cache::lock('payments:reconcile', 120);
+        try {
+            if (! $lock->get()) {
+                return ['skipped' => 1];
+            }
+        } catch (Throwable $exception) {
+            return SqliteContention::isBusy($exception) ? ['busy' => 1] : throw $exception;
+        }
+        try {
+            return $this->reconcileBatch($order, $limit);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function reconcileBatch(?string $order, int $limit): array
+    {
         $query = DB::table('payments')->whereIn('status', ['pending', 'review']);
         if ($order !== null) {
             $query->where('order_id', $order);
@@ -181,20 +199,22 @@ class MidtransSandboxService
         if ($payment->status === 'review' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
             $this->touch($payment);
 
-            return 'review';
+            return 'unchanged';
         }
-        $status = $this->refresh($payment);
+        $status = $this->refresh($payment, $applied);
         if ($status === null && $payment->status === 'pending' && $payment->created_at <= now()->subHours(48)->toDateTimeString()) {
-            DB::table('payments')->where('id', $payment->id)->where('status', 'pending')
-                ->update(['status' => 'expired', 'updated_at' => now()]);
-
-            return 'expired';
+            return DB::table('payments')->where('id', $payment->id)->where('status', 'pending')
+                ->update(['status' => 'expired', 'updated_at' => now()]) ? 'expired' : 'unchanged';
         }
         if ($status === null || $status === $payment->status) {
             $this->touch($payment);
         }
 
-        return $status ?? 'unrecorded';
+        return match (true) {
+            $status === null => 'unrecorded',
+            $applied !== null && $applied !== $payment->status => $applied,
+            default => 'unchanged',
+        };
     }
 
     private function touch(object $payment): void
@@ -219,8 +239,9 @@ class MidtransSandboxService
         ] + ($database ? ['sqlstate' => $exception->errorInfo[0] ?? null, 'driver_code' => $exception->errorInfo[1] ?? null] : []));
     }
 
-    private function refresh(object $payment): ?string
+    private function refresh(object $payment, ?string &$applied = null): ?string
     {
+        $applied = null;
         if ($payment->status === 'paid') {
             return 'paid';
         }
@@ -228,7 +249,7 @@ class MidtransSandboxService
         if ($current === null) {
             return null;
         }
-        $this->apply($payment, $this->paymentStatus($current));
+        $applied = $this->apply($payment, $this->paymentStatus($current));
 
         return DB::table('payments')->where('id', $payment->id)->value('status');
     }
@@ -253,7 +274,7 @@ class MidtransSandboxService
         return $current;
     }
 
-    private function apply(object $payment, string $status): void
+    private function apply(object $payment, string $status): ?string
     {
         if ($status === 'paid' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
             $status = 'review';
@@ -276,6 +297,8 @@ class MidtransSandboxService
         if ($changed && $status === 'review') {
             Log::warning('payment.review', ['payment_id' => $payment->id, 'plan_id' => $payment->plan_id]);
         }
+
+        return $changed ? $status : null;
     }
 
     private function paymentStatus(array $data): string
