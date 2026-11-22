@@ -8,6 +8,7 @@ use App\Services\GoogleLoginService;
 use App\Services\MidtransSandboxService;
 use App\Services\RecommendationOperationService;
 use App\Services\SubscriptionService;
+use App\Support\SqliteContention;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
@@ -214,6 +215,14 @@ class PremiumSubscriptionTest extends TestCase
         $webhook()->assertStatus(503)->assertHeader('Retry-After', '2')
             ->assertJsonPath('message', 'Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.');
         $sync()->assertSessionHas('status_type', 'warning');
+        DB::enableQueryLog();
+        $page = SqliteContention::response(Request::create('/langganan/status', 'POST'));
+        $this->assertSame([], DB::getQueryLog());
+        DB::disableQueryLog();
+        $this->assertSame([503, '2'], [$page->getStatusCode(), $page->headers->get('Retry-After')]);
+        $this->assertStringContainsString('<h1 class="section-title">Pembayaran sedang sibuk</h1>', $page->getContent());
+        $this->assertStringContainsString('href="'.route('subscription.show').'"', $page->getContent());
+        $this->assertStringNotContainsString('Pembayaran', SqliteContention::response(Request::create('/rekomendasi', 'POST'))->getContent());
         $subscriptions->failure = new RuntimeException('fixture');
         $webhook()->assertStatus(500);
         $sync()->assertSessionHas('status_type', 'error');

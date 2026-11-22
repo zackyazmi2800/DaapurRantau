@@ -31,15 +31,23 @@ class SqliteContention
 
     public static function response(Request $request): Response
     {
-        $message = $request->is('api/midtrans/*', 'langganan', 'langganan/*')
+        $payment = $request->is('api/midtrans/*', 'langganan', 'langganan/*');
+        $message = $payment
             ? 'Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.'
             : 'Penyimpanan sedang sibuk. Tunggu sebentar lalu kirim ulang pencarian yang sama. Jangan membuat pencarian baru.';
         $headers = ['Retry-After' => '2', 'Cache-Control' => 'no-store'];
 
         // Do not render the application layout, read quota, or flash session here:
         // the database/session/cache may itself be the failing component.
-        return $request->expectsJson() || $request->is('api/*')
-            ? response()->json(['message' => $message], 503, $headers)
-            : response('<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Penyimpanan sedang sibuk</title><main><h1>Penyimpanan sedang sibuk</h1><p>'.$message.'</p></main></html>', 503, $headers + ['Content-Type' => 'text/html; charset=UTF-8']);
+        if ($request->expectsJson() || $request->is('api/*')) {
+            return response()->json(['message' => $message], 503, $headers);
+        }
+        $title = $payment ? 'Pembayaran sedang sibuk' : 'Penyimpanan sedang sibuk';
+        $html = '<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>'.$title.'</title><main><h1>'.$title.'</h1><p>'.$message.'</p></main></html>';
+        if ($payment) {
+            $html = rescue(fn () => view('errors.payment-busy', ['message' => $message])->render(), $html, false);
+        }
+
+        return response($html, 503, $headers + ['Content-Type' => 'text/html; charset=UTF-8']);
     }
 }

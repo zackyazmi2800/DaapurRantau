@@ -43,7 +43,7 @@ Perintah terjadwal setiap lima menit, tetapi baru berjalan jika `schedule:work` 
 | `failed`, `expired` | Gagal atau kedaluwarsa. Settlement yang datang kemudian tetap dapat mengubahnya menjadi `paid`. |
 | `review` | Midtrans menyatakan lunas, tetapi kode paket tidak dikenali. Premium belum ditambahkan dan kejadian dicatat di log sebagai `payment.review`. Setelah paket pada pembayaran diperbaiki, rekonsiliasi mengaktifkannya satu kali. |
 
-Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status.
+Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status. Jika kunci lebih dulu mengenai session atau pembatas laju, halaman pembayaran menampilkan halaman 503 bermerek dengan tautan kembali ke Langganan saya; halaman itu dirender tanpa query database.
 
 ## Perhitungan kuota dan masa aktif
 
@@ -109,6 +109,7 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `resources/views/components/favorite-button.blade.php` (diubah)
 - `resources/views/components/visitor-notice.blade.php` (diubah)
 - `resources/views/recommendations/operation-error.blade.php` (diubah)
+- `resources/views/errors/payment-busy.blade.php` (baru)
 - `resources/views/subscription/pricing.blade.php` (baru)
 - `resources/views/subscription/required.blade.php` (baru)
 - `resources/views/subscription/show.blade.php` (baru)
