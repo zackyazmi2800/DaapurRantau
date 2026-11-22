@@ -36,10 +36,10 @@ class MidtransSandboxService
         return $key;
     }
 
-    private function client(): PendingRequest
+    private function client(int $connect = 3, int $timeout = 8): PendingRequest
     {
         return Http::withBasicAuth($this->serverKey(), '')->acceptJson()->withoutRedirecting()
-            ->connectTimeout(3)->timeout(8);
+            ->connectTimeout($connect)->timeout($timeout);
     }
 
     public function checkout(int $userId, string $code): string
@@ -81,6 +81,9 @@ class MidtransSandboxService
         $payment = DB::table('payments')->where('order_id', $order)->first();
         abort_unless($payment, 404);
         abort_unless($this->matchesAmount($notice['gross_amount'], $payment->amount), 422);
+        if ($payment->status === 'paid') {
+            return;
+        }
 
         // Status and fraud flags are outside the notification signature.
         $current = $this->currentStatus($payment);
@@ -116,7 +119,7 @@ class MidtransSandboxService
     private function currentStatus(object $payment): ?array
     {
         try {
-            $response = $this->client()->get("https://api.sandbox.midtrans.com/v2/{$payment->order_id}/status");
+            $response = $this->client(2, 5)->get("https://api.sandbox.midtrans.com/v2/{$payment->order_id}/status");
         } catch (ConnectionException) {
             abort(503, 'Status pembayaran belum dapat diverifikasi.');
         }
