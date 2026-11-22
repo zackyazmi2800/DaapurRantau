@@ -9,6 +9,7 @@ use App\Services\MidtransSandboxService;
 use App\Services\RecommendationOperationService;
 use App\Services\SubscriptionService;
 use App\Support\SqliteContention;
+use ArrayObject;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
@@ -19,6 +20,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\View;
 use Illuminate\Support\Str;
 use PDOException;
 use RuntimeException;
@@ -314,6 +316,137 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertDatabaseCount('subscriptions', 1);
         $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-31 00:11:00']);
         $this->assertSame(['failed', 'expired'], array_map($status, [$gagal, $lewat]));
+    }
+
+    private function recordLogs(): ArrayObject
+    {
+        config(['logging.default' => 'null', 'app.debug' => false]);
+        $logged = new ArrayObject;
+        Event::listen(MessageLogged::class, fn (MessageLogged $event) => $logged->append(['level' => $event->level, 'message' => $event->message] + $event->context));
+
+        return $logged;
+    }
+
+    public function test_checkout_marks_payment_failed_and_leaks_nothing_when_snap_is_unavailable(): void
+    {
+        $logged = $this->recordLogs();
+        $user = User::factory()->create();
+        $this->actingAs($user);
+        $failure = null;
+        Http::fake(function ($request) use (&$failure) {
+            $this->assertSame('https://app.sandbox.midtrans.com/snap/v1/transactions', $request->url());
+
+            return $failure($request);
+        });
+        $failures = [
+            fn () => Http::response(['token' => 'leaked-snap-token', 'error_messages' => ['fixture-gateway-detail']], 500),
+            fn () => Http::response(['redirect_url' => 'https://fixture.invalid/leaked-snap-token'], 201),
+            fn () => Http::response(['token' => ['leaked-snap-token']], 201),
+            fn ($request) => Http::failedConnection('fixture-gateway-detail')($request),
+        ];
+        foreach ($failures as $index => $failure) {
+            $response = $index % 2
+                ? $this->postJson('/langganan/checkout', ['plan' => 'weekly'])->assertExactJson(['message' => 'Checkout belum tersedia. Silakan coba kembali.'])
+                : $this->post('/langganan/checkout', ['plan' => 'weekly']);
+            $response->assertServiceUnavailable()->assertDontSee('leaked-snap-token')->assertDontSee('fixture-gateway-detail')->assertDontSee('SB-Mid-server-');
+            $this->assertDatabaseCount('payments', $index + 1);
+        }
+        $this->assertSame(4, DB::table('payments')->where(['user_id' => $user->id, 'status' => 'failed', 'amount' => 5000])->whereNull('snap_token')->count());
+        $this->assertDatabaseCount('subscriptions', 0);
+        $this->get('/langganan?bayar='.DB::table('payments')->value('order_id'))->assertOk()->assertSee('Akun Free')->assertSee('Gagal')
+            ->assertDontSee('snap.js')->assertDontSee('data-snap-checkout', false)->assertDontSee('Lanjutkan pembayaran')->assertDontSee('Perbarui status');
+        Http::assertSentCount(4);
+        $this->assertSame([], $logged->getArrayCopy());
+    }
+
+    public function test_reconciliation_stays_idle_without_a_usable_sandbox_and_survives_gateway_outage(): void
+    {
+        $logged = $this->recordLogs();
+        $this->travelTo(Carbon::parse('2026-01-10 00:00 UTC'));
+        $user = User::factory()->create();
+        $order = (string) Str::uuid();
+        DB::table('payments')->insert(['order_id' => $order, 'user_id' => $user->id, 'plan_id' => DB::table('subscription_plans')->where('code', 'weekly')->value('id'),
+            'amount' => 5000, 'created_at' => now()->subMinutes(30), 'updated_at' => now()->subMinutes(30)]);
+        $paid = ['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => '200', 'transaction_status' => 'settlement', 'fraud_status' => 'accept'];
+        $gateway = fn () => Http::response($paid);
+        Http::fake(function ($request) use (&$gateway, $order) {
+            $this->assertSame("https://api.sandbox.midtrans.com/v2/{$order}/status", $request->url());
+
+            return $gateway($request);
+        });
+        $reconcile = fn () => app(MidtransSandboxService::class)->reconcile();
+        $row = fn () => (array) DB::table('payments')->where('order_id', $order)->first(['status', 'updated_at']);
+        $before = $row();
+        $working = config('midtrans');
+
+        foreach ([['is_production' => true], ['server_key' => null], ['server_key' => 'Mid-server-fixture'], ['signature_secret_key' => ''], ['client_key' => null]] as $broken) {
+            config(['midtrans' => $broken + $working]);
+            $this->assertSame(['inactive' => 1], $reconcile());
+            $this->artisan('payments:reconcile', ['--order' => $order])->expectsOutputToContain('inactive=1')->assertSuccessful();
+        }
+        config(['midtrans' => $working]);
+        $this->app['env'] = 'production';
+        $this->assertSame(['inactive' => 1], $reconcile());
+        $this->app['env'] = 'testing';
+        Http::assertNothingSent();
+        $this->assertSame($before, $row());
+
+        $gateway = fn ($request) => Http::failedConnection()($request);
+        $this->assertSame(['unverified' => 1], $reconcile());
+        $this->travel(11)->minutes();
+        $gateway = fn () => Http::response([], 500);
+        $this->assertSame(['unverified' => 1], $reconcile());
+        Http::assertSentCount(2);
+        $this->assertSame('pending', $row()['status']);
+        $this->assertDatabaseCount('subscriptions', 0);
+        $this->assertSame([], $logged->getArrayCopy());
+
+        $this->travel(11)->minutes();
+        $gateway = fn () => Http::response($paid);
+        $this->assertSame(['paid' => 1], $reconcile());
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-17 00:22:00']);
+        Http::assertNotSent(fn ($request) => ! str_starts_with($request->url(), 'https://api.sandbox.midtrans.com/'));
+        $this->assertSame([], $logged->getArrayCopy());
+    }
+
+    public function test_busy_payment_page_falls_back_safely_when_its_view_cannot_render(): void
+    {
+        $logged = $this->recordLogs();
+        $locked = new PDOException('database is locked');
+        $locked->errorInfo = ['HY000', 5, 'database is locked'];
+        $this->app->instance(SubscriptionService::class, new class(new QueryException('sqlite', 'select * from "subscriptions" where "user_id" = ?', [7], $locked)) extends SubscriptionService
+        {
+            public function __construct(private Throwable $busy) {}
+
+            public function active(int $userId): ?object
+            {
+                throw $this->busy;
+            }
+        });
+        $this->actingAs(User::factory()->create());
+        $this->get('/langganan')->assertStatus(503)->assertHeader('Retry-After', '2')->assertSee('Kembali ke Langganan saya');
+
+        View::composer('errors.payment-busy', fn () => throw new RuntimeException('fixture-view-failure '.base_path('resources/views/errors/payment-busy.blade.php')));
+        $unsafe = '/fixture-view-failure|select \*|"subscriptions"|SQLSTATE|database is locked|Stack trace|#\d+ |\.php|'.preg_quote(base_path(), '/').'/i';
+        $response = $this->get('/langganan')->assertStatus(503)->assertHeader('Retry-After', '2');
+        $body = $response->getContent();
+        $this->assertStringStartsWith('text/html', $response->headers->get('Content-Type'));
+        $this->assertStringContainsString('no-store', $response->headers->get('Cache-Control'));
+        $this->assertStringContainsString('<title>Pembayaran sedang sibuk</title>', $body);
+        $this->assertStringContainsString('Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.', $body);
+        $this->assertStringNotContainsString('Kembali ke Langganan saya', $body);
+        $this->assertDoesNotMatchRegularExpression($unsafe, $body);
+        $this->getJson('/langganan')->assertStatus(503)->assertHeader('Retry-After', '2')
+            ->assertExactJson(['message' => 'Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.']);
+
+        DB::enableQueryLog();
+        $page = SqliteContention::response(Request::create('/langganan/status', 'POST'));
+        $this->assertSame([], DB::getQueryLog());
+        DB::disableQueryLog();
+        $this->assertSame([503, '2', $body], [$page->getStatusCode(), $page->headers->get('Retry-After'), $page->getContent()]);
+        $this->assertSame([['level' => 'warning', 'message' => 'database.contention', 'driver' => 'sqlite', 'status' => 'busy']], array_values(array_unique($logged->getArrayCopy(), SORT_REGULAR)));
+        $this->assertCount(3, $logged);
+        $this->assertDoesNotMatchRegularExpression($unsafe, json_encode($logged->getArrayCopy(), JSON_UNESCAPED_SLASHES));
     }
 
     public function test_failed_generation_retry_replay_and_wib_daily_reset(): void
