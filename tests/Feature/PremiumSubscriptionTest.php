@@ -12,8 +12,10 @@ use App\Support\SqliteContention;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
@@ -184,6 +186,11 @@ class PremiumSubscriptionTest extends TestCase
     public function test_payment_failures_return_safe_responses_and_keep_state(): void
     {
         Exceptions::fake();
+        config(['logging.default' => 'null', 'app.debug' => false]);
+        $logged = [];
+        Event::listen(MessageLogged::class, function (MessageLogged $event) use (&$logged) {
+            $logged[] = ['level' => $event->level, 'message' => $event->message] + $event->context;
+        });
         $user = User::factory()->create();
         $state = null;
         Http::fake(function ($request) use (&$state) {
@@ -224,13 +231,25 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertStringContainsString('href="'.route('subscription.show').'"', $page->getContent());
         $this->assertStringNotContainsString('Pembayaran', SqliteContention::response(Request::create('/rekomendasi', 'POST'))->getContent());
         $subscriptions->failure = new RuntimeException('fixture');
-        $webhook()->assertStatus(500);
+        $webhook()->assertStatus(500)->assertExactJson(['message' => 'Server Error']);
         $sync()->assertSessionHas('status_type', 'error');
-        Exceptions::assertReported(RuntimeException::class);
+        $subscriptions->failure = null;
+        DB::statement("CREATE TRIGGER deny_subscription BEFORE INSERT ON subscriptions BEGIN SELECT RAISE(ABORT, 'fixture-denied'); END");
+        $webhook()->assertStatus(500)->assertExactJson(['message' => 'Server Error']);
+        $this->travel(11)->minutes();
+        $this->assertSame(['error' => 1], app(MidtransSandboxService::class)->reconcile());
+        DB::statement('DROP TRIGGER deny_subscription');
+        Exceptions::assertNotReported(RuntimeException::class);
+        Exceptions::assertNotReported(fn (QueryException $exception) => ! SqliteContention::isBusy($exception));
+        $failures = array_values(array_filter($logged, fn (array $entry) => $entry['message'] === 'payment.processing_failed'));
+        $this->assertSame(['webhook', 'sync', 'webhook', 'reconcile'], array_column($failures, 'operation'));
+        $this->assertSame(['unexpected', 'unexpected', 'database', 'database'], array_column($failures, 'category'));
+        $this->assertSame([['error'], [DB::table('payments')->value('id')]], [array_values(array_unique(array_column($failures, 'level'))), array_values(array_unique(array_column($failures, 'payment_id')))]);
+        $this->assertSame([QueryException::class, '23000', 19, SubscriptionService::class.'::extend'], [$failures[2]['exception'], $failures[2]['sqlstate'], $failures[2]['driver_code'], Str::beforeLast($failures[2]['origin'], ':')]);
+        $this->assertDoesNotMatchRegularExpression('/insert into|subscriptions|fixture|:memory:|\.php|#\d|'.preg_quote(base_path(), '/').'/', json_encode($failures, JSON_UNESCAPED_SLASHES));
         $this->assertDatabaseHas('payments', ['order_id' => $order, 'status' => 'pending']);
         $this->assertDatabaseCount('subscriptions', 0);
 
-        $subscriptions->failure = null;
         $webhook()->assertOk();
         $this->assertDatabaseHas('payments', ['order_id' => $order, 'status' => 'paid']);
         $sent = Http::recorded()->count();

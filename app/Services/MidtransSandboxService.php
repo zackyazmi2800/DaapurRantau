@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use PDOException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Throwable;
 
@@ -99,7 +100,16 @@ class MidtransSandboxService
             return;
         }
 
-        $this->apply($payment, $status);
+        try {
+            $this->apply($payment, $status);
+        } catch (Throwable $exception) {
+            if ($exception instanceof HttpException || SqliteContention::isBusy($exception)) {
+                throw $exception;
+            }
+            $this->logFailure('webhook', $payment, $exception);
+
+            throw new HttpException(500, 'Server Error');
+        }
     }
 
     public function sync(int $userId, string $order): string|false|null
@@ -114,7 +124,7 @@ class MidtransSandboxService
             if (SqliteContention::isBusy($exception)) {
                 return 'busy';
             }
-            report($exception);
+            $this->logFailure('sync', $payment, $exception);
 
             return 'error';
         }
@@ -155,7 +165,7 @@ class MidtransSandboxService
                     $counts['busy'] = 1;
                     break;
                 }
-                report($exception);
+                $this->logFailure('reconcile', $payment, $exception);
                 rescue(fn () => $this->touch($payment), report: false);
                 $outcome = 'error';
                 $failures++;
@@ -190,6 +200,23 @@ class MidtransSandboxService
     private function touch(object $payment): void
     {
         DB::table('payments')->where('id', $payment->id)->where('status', $payment->status)->update(['updated_at' => now()]);
+    }
+
+    private function logFailure(string $operation, object $payment, Throwable $exception): void
+    {
+        $name = fn (string $class): string => strstr($class, "\0", true) ?: $class;
+        $frames = $exception->getTrace();
+        foreach ($frames as $index => $frame) {
+            if (str_starts_with($frame['class'] ?? '', 'App\\')) {
+                $origin = $name($frame['class']).'::'.$frame['function'].':'.($index ? $frames[$index - 1]['line'] ?? 0 : $exception->getLine());
+                break;
+            }
+        }
+        $database = $exception instanceof PDOException;
+        Log::error('payment.processing_failed', [
+            'payment_id' => $payment->id, 'operation' => $operation, 'category' => $database ? 'database' : 'unexpected',
+            'exception' => $name($exception::class), 'origin' => $origin ?? null,
+        ] + ($database ? ['sqlstate' => $exception->errorInfo[0] ?? null, 'driver_code' => $exception->errorInfo[1] ?? null] : []));
     }
 
     private function refresh(object $payment): ?string

@@ -43,7 +43,7 @@ Perintah terjadwal setiap lima menit, tetapi baru berjalan jika `schedule:work` 
 | `failed`, `expired` | Gagal atau kedaluwarsa. Settlement yang datang kemudian tetap dapat mengubahnya menjadi `paid`. |
 | `review` | Midtrans menyatakan lunas, tetapi kode paket tidak dikenali. Premium belum ditambahkan dan kejadian dicatat di log sebagai `payment.review`. Setelah paket pada pembayaran diperbaiki, rekonsiliasi mengaktifkannya satu kali. |
 
-Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status. Jika kunci lebih dulu mengenai session atau pembatas laju, halaman pembayaran menampilkan halaman 503 bermerek dengan tautan kembali ke Langganan saya; halaman itu dirender tanpa query database.
+Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status. Jika kunci lebih dulu mengenai session atau pembatas laju, halaman pembayaran menampilkan halaman 503 bermerek dengan tautan kembali ke Langganan saya; halaman itu dirender tanpa query database. Kegagalan saat memproses pembayaran (webhook, sinkronisasi, rekonsiliasi) dicatat sebagai `payment.processing_failed` berisi ID pembayaran, jenis operasi, kategori, jenis exception, dan lokasi kode, tanpa SQL, nilai parameter, path, atau stack trace.
 
 ## Perhitungan kuota dan masa aktif
 
