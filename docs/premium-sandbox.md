@@ -24,6 +24,27 @@ php artisan route:list --path=midtrans
 
 Snap membuat order UUID dengan harga dari database. Callback browser kembali ke halaman langganan. Webhook mencocokkan signature SHA512 atas order, kode, nominal asli, dan Signature Secret Key, lalu memeriksa order dan nominal lagi melalui Get Transaction Status Sandbox. Transisi lunas dan penambahan masa aktif dilakukan dalam satu transaksi. Status sukses memerlukan settlement atau capture dengan kode 200, serta fraud accept bila tersedia (wajib pada capture). Jika gateway sementara gagal diverifikasi, endpoint mengembalikan 503 agar notifikasi dapat dikirim ulang. Pilih **Perbarui status** setelah notifikasi sampai. [Notifikasi Midtrans](https://docs.midtrans.com/docs/https-notification-webhooks) · [Get Transaction Status](https://docs.midtrans.com/reference/get-transaction-status) · [Snap JS](https://docs.midtrans.com/reference/snap-js)
 
+## Rekonsiliasi dan status pembayaran
+
+Selain webhook dan tombol **Perbarui status**, pembayaran dapat diperiksa ulang ke Midtrans Sandbox lewat perintah berikut. Ketiganya memakai klaim pembayaran yang sama, sehingga satu pembayaran hanya mengaktifkan Premium satu kali.
+
+```sh
+php artisan payments:reconcile
+php artisan payments:reconcile --order=<uuid> --limit=20
+php artisan schedule:work
+```
+
+Perintah terjadwal setiap lima menit, tetapi baru berjalan jika `schedule:work` atau cron `schedule:run` dinyalakan. Perintah memakai database pada environment tempat ia dijalankan. Yang diperiksa hanya pembayaran `pending` dan `review` yang berumur minimal 10 menit, paling banyak 20 per putaran, dengan jeda 10 menit (umur di bawah 2 jam) atau 60 menit per pembayaran. Pembayaran `pending` berumur lebih dari 7 hari hanya diperiksa lewat `--order`. Putaran berhenti jika Midtrans gagal tiga kali berturut-turut atau database sedang sibuk.
+
+| Status | Arti |
+| --- | --- |
+| `pending` | Menunggu pembayaran. Jika Midtrans tidak pernah mencatat transaksinya, status menjadi `expired` setelah 48 jam. |
+| `paid` | Lunas dan Premium sudah ditambahkan. Status ini final. |
+| `failed`, `expired` | Gagal atau kedaluwarsa. Settlement yang datang kemudian tetap dapat mengubahnya menjadi `paid`. |
+| `review` | Midtrans menyatakan lunas, tetapi kode paket tidak dikenali. Premium belum ditambahkan dan kejadian dicatat di log sebagai `payment.review`. Setelah paket pada pembayaran diperbaiki, rekonsiliasi mengaktifkannya satu kali. |
+
+Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status.
+
 ## Perhitungan kuota dan masa aktif
 
 Tanggal kuota mengikuti waktu reservasi di Asia/Jakarta. Transaksi mengambil kunci tulis akun, lalu menghitung operasi yang sedang direservasi dan pencarian berhasil hari itu. Proses Gemini berjalan setelah transaksi reservasi selesai. Penyimpanan hasil, penambahan kuota dan riwayat Premium terjadi bersama. Kegagalan melepas reservasi. Jika worker mati, reservasi dapat diambil kembali setelah lease 10 menit berakhir. Membuka detail dan mengirim ulang kunci operasi sukses yang sama tidak memakai kuota lagi.
@@ -71,10 +92,12 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `app/Http/Middleware/RequireCollectionAccount.php` (diubah)
 - `app/Http/Requests/CheckoutRequest.php` (baru)
 - `app/Http/Requests/MidtransNotificationRequest.php` (baru)
+- `app/Http/Requests/PaymentStatusRequest.php` (baru)
 - `app/Services/MidtransSandboxService.php` (baru)
 - `app/Services/QuotaService.php` (baru)
 - `app/Services/RecommendationOperationService.php` (diubah)
 - `app/Services/SubscriptionService.php` (baru)
+- `app/Support/SqliteContention.php` (diubah)
 - `bootstrap/app.php` (diubah)
 - `config/midtrans.php` (baru)
 - `database/migrations/2026_11_21_000001_create_premium_tables.php` (baru)
@@ -89,6 +112,7 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `resources/views/subscription/pricing.blade.php` (baru)
 - `resources/views/subscription/required.blade.php` (baru)
 - `resources/views/subscription/show.blade.php` (baru)
+- `routes/console.php` (diubah)
 - `routes/web.php` (diubah)
 - `tests/Feature/PremiumSubscriptionTest.php` (baru)
 

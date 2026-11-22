@@ -5,15 +5,22 @@ namespace Tests\Feature;
 use App\Exceptions\RecommendationOperationException;
 use App\Models\User;
 use App\Services\GoogleLoginService;
+use App\Services\MidtransSandboxService;
 use App\Services\RecommendationOperationService;
+use App\Services\SubscriptionService;
+use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use PDOException;
+use RuntimeException;
 use Tests\Support\GeminiFixture;
+use Throwable;
 
 class PremiumSubscriptionTest extends TestCase
 {
@@ -171,6 +178,114 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertDatabaseCount('subscriptions', 1);
         $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-02-27 18:02:00']);
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'midtrans.com') && ! str_contains($request->url(), 'sandbox'));
+    }
+
+    public function test_payment_failures_return_safe_responses_and_keep_state(): void
+    {
+        Exceptions::fake();
+        $user = User::factory()->create();
+        $state = null;
+        Http::fake(function ($request) use (&$state) {
+            return str_contains($request->url(), '/snap/v1/transactions') ? Http::response(['token' => 'failure-fixture']) : Http::response($state);
+        });
+        $subscriptions = new class extends SubscriptionService
+        {
+            public ?Throwable $failure = null;
+
+            public function extend(object $payment): void
+            {
+                if ($this->failure) {
+                    throw $this->failure;
+                }
+                parent::extend($payment);
+            }
+        };
+        $this->app->instance(SubscriptionService::class, $subscriptions);
+        $this->actingAs($user)->post('/langganan/checkout', ['plan' => 'weekly'])->assertStatus(303);
+        $order = DB::table('payments')->value('order_id');
+        $state = ['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => '200', 'transaction_status' => 'settlement', 'fraud_status' => 'accept'];
+        $notice = json_encode($state + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.signature_secret_key'))]);
+        $webhook = fn () => $this->call('POST', '/api/midtrans/notification', [], [], [], ['CONTENT_TYPE' => 'application/json'], $notice);
+        $sync = fn () => $this->post('/langganan/status', ['order_id' => $order])->assertRedirect('/langganan');
+
+        $locked = new PDOException('database is locked');
+        $locked->errorInfo = ['HY000', 5, 'database is locked'];
+        $subscriptions->failure = new QueryException('sqlite', 'update', [], $locked);
+        $webhook()->assertStatus(503)->assertHeader('Retry-After', '2')
+            ->assertJsonPath('message', 'Layanan pembayaran sedang sibuk. Tunggu sebentar lalu coba kembali.');
+        $sync()->assertSessionHas('status_type', 'warning');
+        $subscriptions->failure = new RuntimeException('fixture');
+        $webhook()->assertStatus(500);
+        $sync()->assertSessionHas('status_type', 'error');
+        Exceptions::assertReported(RuntimeException::class);
+        $this->assertDatabaseHas('payments', ['order_id' => $order, 'status' => 'pending']);
+        $this->assertDatabaseCount('subscriptions', 0);
+
+        $subscriptions->failure = null;
+        $webhook()->assertOk();
+        $this->assertDatabaseHas('payments', ['order_id' => $order, 'status' => 'paid']);
+        $sent = Http::recorded()->count();
+        $webhook()->assertOk();
+        $sync()->assertSessionHas('status_type', 'success');
+        Http::assertSentCount($sent);
+        $this->assertDatabaseCount('subscriptions', 1);
+    }
+
+    public function test_reconciliation_and_unknown_plan_review_activate_once(): void
+    {
+        config(['logging.default' => 'null']);
+        $this->travelTo(Carbon::parse('2026-01-10 00:00 UTC'));
+        $user = User::factory()->create();
+        $states = [];
+        Http::fake(function ($request) use (&$states) {
+            $order = explode('/', $request->url())[4];
+
+            return isset($states[$order]) ? Http::response($states[$order]) : Http::response(['status_code' => '404'], 404);
+        });
+        $weekly = DB::table('subscription_plans')->where('code', 'weekly')->value('id');
+        $legacy = DB::table('subscription_plans')->insertGetId(['code' => 'legacy', 'name' => 'Paket Lama', 'price' => 5000]);
+        $payment = function (int $plan, string $status = 'pending') use ($user) {
+            $order = (string) Str::uuid();
+            DB::table('payments')->insert(['order_id' => $order, 'user_id' => $user->id, 'plan_id' => $plan, 'amount' => 5000, 'status' => $status, 'created_at' => now(), 'updated_at' => now()]);
+
+            return $order;
+        };
+        $settled = fn (string $order) => ['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => '200', 'transaction_status' => 'settlement', 'fraud_status' => 'accept'];
+        $notify = fn (string $order) => $this->postJson('/api/midtrans/notification', $settled($order) + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.signature_secret_key'))]);
+        $status = fn (string $order) => DB::table('payments')->where('order_id', $order)->value('status');
+        $reconcile = fn () => app(MidtransSandboxService::class)->reconcile();
+        [$review, $lunas, $kosong, $gagal, $lewat] = [$payment($legacy), $payment($weekly), $payment($weekly), $payment($weekly, 'failed'), $payment($weekly, 'expired')];
+        $states = [$review => $settled($review), $lunas => $settled($lunas), $gagal => $settled($gagal), $lewat => $settled($lewat)];
+
+        $notify($review)->assertOk();
+        $this->assertSame('review', $status($review));
+        $this->assertDatabaseCount('subscriptions', 0);
+        $this->actingAs($user)->get('/langganan')->assertOk()->assertSee('Sedang ditinjau');
+        $this->assertSame([], $reconcile());
+
+        $this->travel(11)->minutes();
+        $this->assertEquals(['review' => 1, 'paid' => 1, 'unrecorded' => 1], $reconcile());
+        $this->assertSame(['review', 'paid', 'pending', 'failed', 'expired'], array_map($status, [$review, $lunas, $kosong, $gagal, $lewat]));
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-17 00:11:00']);
+        $this->assertSame([], $reconcile());
+        Http::assertSentCount(3);
+
+        DB::table('payments')->where('order_id', $review)->update(['plan_id' => $weekly]);
+        $this->travel(11)->minutes();
+        $this->assertEquals(['paid' => 1, 'unrecorded' => 1], $reconcile());
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-24 00:11:00']);
+        $this->artisan('payments:reconcile', ['--order' => $review])->expectsOutputToContain('Tidak ada pembayaran')->assertSuccessful();
+        $this->artisan('payments:reconcile', ['--order' => 'bukan-uuid'])->assertFailed();
+
+        $this->travelTo(Carbon::parse('2026-01-12 01:00 UTC'));
+        $this->assertEquals(['expired' => 1], $reconcile());
+        $this->assertSame('expired', $status($kosong));
+        $states[$kosong] = $settled($kosong);
+        $notify($kosong)->assertOk();
+        $this->assertSame('paid', $status($kosong));
+        $this->assertDatabaseCount('subscriptions', 1);
+        $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-31 00:11:00']);
+        $this->assertSame(['failed', 'expired'], array_map($status, [$gagal, $lewat]));
     }
 
     public function test_failed_generation_retry_replay_and_wib_daily_reset(): void
