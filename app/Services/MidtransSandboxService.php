@@ -6,6 +6,7 @@ use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
@@ -138,16 +139,27 @@ class MidtransSandboxService
 
     private function apply(object $payment, string $status): void
     {
-        DB::transaction(function () use ($payment, $status) {
+        if ($status === 'paid' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
+            $status = 'review';
+        }
+        $changed = DB::transaction(function () use ($payment, $status) {
             $query = DB::table('payments')->where('id', $payment->id)->where('status', '!=', 'paid');
             if ($status === 'pending') {
                 $query->where('status', 'pending');
+            }
+            if ($status === 'review') {
+                $query->where('status', '!=', 'review');
             }
             $changed = $query->update(['status' => $status, 'updated_at' => now()]);
             if ($changed && $status === 'paid') {
                 $this->subscriptions->extend($payment);
             }
+
+            return $changed;
         }, 3);
+        if ($changed && $status === 'review') {
+            Log::warning('payment.review', ['payment_id' => $payment->id, 'plan_id' => $payment->plan_id]);
+        }
     }
 
     private function paymentStatus(array $data): string

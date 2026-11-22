@@ -13,6 +13,11 @@ class SubscriptionService
             ->where('ends_at', '>', now('UTC'))->first();
     }
 
+    public function supports(int $planId): bool
+    {
+        return in_array(DB::table('subscription_plans')->where('id', $planId)->value('code'), ['weekly', 'monthly'], true);
+    }
+
     // Called under the payment transaction, after claiming the payment exactly once.
     public function extend(object $payment): void
     {
