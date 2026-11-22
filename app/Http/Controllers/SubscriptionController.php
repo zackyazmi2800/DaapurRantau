@@ -48,6 +48,8 @@ class SubscriptionController extends Controller
             'failed' => ['Pembayaran gagal atau dibatalkan.', 'warning'],
             'expired' => ['Pembayaran telah kedaluwarsa.', 'warning'],
             'review' => ['Pembayaran diterima dan sedang ditinjau. Premium aktif setelah peninjauan selesai.', 'info'],
+            'busy' => ['Sistem sedang sibuk. Status belum berubah, coba lagi sebentar.', 'warning'],
+            'error' => ['Pembayaran belum dapat diproses. Status belum berubah, silakan coba kembali.', 'error'],
             null => ['Transaksi belum tercatat di Midtrans. Selesaikan pembayaran terlebih dahulu.', 'info'],
             default => ['Status pembayaran belum dapat diperiksa. Silakan coba kembali.', 'error'],
         };

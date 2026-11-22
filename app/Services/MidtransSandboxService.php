@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Support\SqliteContention;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\DB;
@@ -9,6 +10,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpKernel\Exception\HttpException;
+use Throwable;
 
 class MidtransSandboxService
 {
@@ -105,14 +107,29 @@ class MidtransSandboxService
         $payment = DB::table('payments')->where(['order_id' => $order, 'user_id' => $userId])->first();
         abort_unless($payment, 404);
         try {
-            $current = $this->currentStatus($payment);
-            if ($current === null) {
-                return null;
-            }
-            $this->apply($payment, $this->paymentStatus($current));
+            return $this->refresh($payment);
         } catch (HttpException) {
             return false;
+        } catch (Throwable $exception) {
+            if (SqliteContention::isBusy($exception)) {
+                return 'busy';
+            }
+            report($exception);
+
+            return 'error';
         }
+    }
+
+    private function refresh(object $payment): ?string
+    {
+        if ($payment->status === 'paid') {
+            return 'paid';
+        }
+        $current = $this->currentStatus($payment);
+        if ($current === null) {
+            return null;
+        }
+        $this->apply($payment, $this->paymentStatus($current));
 
         return DB::table('payments')->where('id', $payment->id)->value('status');
     }
