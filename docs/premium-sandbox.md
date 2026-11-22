@@ -49,11 +49,44 @@ Hanya satu rekonsiliasi yang berjalan pada satu waktu per database, baik dari sc
 | Status | Arti |
 | --- | --- |
 | `pending` | Menunggu pembayaran. Jika Midtrans tidak pernah mencatat transaksinya, status menjadi `expired` setelah 48 jam. |
-| `paid` | Lunas dan Premium sudah ditambahkan. Status ini final. |
+| `paid` | Lunas dan Premium sudah ditambahkan. Hanya refund, chargeback atau pembatalan dari Midtrans yang dapat mengubahnya (lihat bagian berikut). |
 | `failed`, `expired` | Gagal atau kedaluwarsa. Settlement yang datang kemudian tetap dapat mengubahnya menjadi `paid`. |
+| `refunded` | Dana dikembalikan penuh. Sisa Premium dari pembayaran ini dicabut. Status ini final. |
+| `chargeback` | Bank menarik kembali seluruh dana. Premium dari pembayaran ini ditangguhkan sampai peninjauan ditutup. |
 | `review` | Midtrans menyatakan lunas, tetapi kode paket tidak dikenali. Premium belum ditambahkan dan kejadian dicatat di log sebagai `payment.review`. Setelah paket pada pembayaran diperbaiki, rekonsiliasi mengaktifkannya satu kali. |
 
 Saat database sibuk, webhook menjawab 503 berformat JSON dengan `Retry-After`, sedangkan sinkronisasi manual menampilkan pesan tanpa mengubah status. Jika kunci lebih dulu mengenai session atau pembatas laju, halaman pembayaran menampilkan halaman 503 bermerek dengan tautan kembali ke Langganan saya; halaman itu dirender tanpa query database. Kegagalan saat memproses pembayaran (webhook, sinkronisasi, rekonsiliasi) dicatat sebagai `payment.processing_failed` berisi ID pembayaran, jenis operasi, kategori, jenis exception, dan lokasi kode, tanpa SQL, nilai parameter, path, atau stack trace. Jika Snap gagal membuat transaksi, payment ditandai `failed` dan browser menerima halaman 503 bermerek (`errors/503.blade.php`) dengan tautan ke Pilihan paket dan Langganan saya; permintaan JSON tetap menerima pesan singkat.
+
+## Refund, chargeback, dan peninjauan
+
+Setiap pembayaran lunas mencatat periode yang dibiayainya di `subscription_periods`; `subscriptions` tetap menjadi ringkasan masa aktif per akun. Refund, chargeback dan pembatalan dicatat di `payment_adjustments`, satu baris per referensi sumber, sehingga notifikasi atau perintah yang diulang tidak mengubah data dua kali. Notifikasi Midtrans tetap melewati pemeriksaan signature, order, nominal dan mata uang, lalu statusnya dicek ulang ke Midtrans sebelum diterapkan.
+
+| Kejadian | Pembayaran | Premium dari pembayaran itu | Peninjauan |
+| --- | --- | --- | --- |
+| Refund penuh (`refund`) | `refunded` | Sisa waktu dicabut segera | Ditutup (`resolved`) |
+| Refund sebagian (`partial_refund`) | tetap `paid` | Tidak diubah | Terbuka (`pending_review`), nominal dicatat |
+| Chargeback penuh (`chargeback`) | `chargeback` | Ditangguhkan | Terbuka |
+| Chargeback sebagian (`partial_chargeback`) | tetap `paid` | Ditangguhkan | Terbuka |
+| Lunas lalu `deny`, `cancel`, `expire` atau `failure` | tetap `paid` | Ditangguhkan | Terbuka |
+
+Hanya waktu yang belum terpakai yang dicabut atau ditangguhkan. Hari yang sudah dipakai tidak ditarik kembali, dan periode dari pembayaran lain dipertahankan utuh: periode yang antre di belakangnya maju sebesar waktu yang dicabut. Waktu yang ditangguhkan disimpan dalam `held_seconds` dan tidak berkurang selama peninjauan. Pembayaran dengan peninjauan terbuka tampil sebagai "Sedang ditinjau". Pembayaran lunas dari sebelum fitur ini yang periodenya tidak dapat direkonstruksi tidak dikurangi otomatis; refundnya dicatat sebagai peninjauan terbuka.
+
+Peninjauan ditutup operator dengan satu keputusan per pembayaran. Tanpa `--confirm` perintah hanya menampilkan rencana.
+
+```sh
+php artisan payments:review <id-pembayaran> --restore --confirm
+php artisan payments:review <id-pembayaran> --revoke --confirm
+```
+
+`--restore` menutup peninjauan sebagai `rejected`: periode yang ditangguhkan dipulihkan dengan menambahkan `held_seconds` ke akhir masa aktif, satu kali, dan pembayaran `chargeback` kembali `paid`. `--revoke` menutupnya sebagai `resolved`: sisa periode dicabut, dan pembayaran yang dibatalkan Midtrans menjadi `failed`. Refund penuh tidak dapat dipulihkan.
+
+Midtrans tidak dapat me-refund Virtual Account. Setelah dana ditransfer manual ke pelanggan, catat dengan perintah berikut. Perintah ini tidak mengirim uang dan tidak menghubungi Midtrans.
+
+```sh
+php artisan payments:refund <id-pembayaran> --amount=5000 --reason="Permintaan pengguna" --reference=<referensi-transfer> --confirm
+```
+
+Tanpa `--confirm` tidak ada yang dicatat. Referensi yang sama tidak dicatat dua kali, dan total refund tidak boleh melebihi nominal pembayaran. Jika totalnya sama dengan nominal pembayaran, aturan refund penuh berlaku; jika kurang, refund masuk peninjauan tanpa mengubah Premium. Refund atau chargeback yang notifikasinya tidak sampai tidak terdeteksi oleh rekonsiliasi, karena rekonsiliasi hanya memeriksa pembayaran `pending` dan `review`.
 
 ## Perhitungan kuota dan masa aktif
 
@@ -87,9 +120,10 @@ Test memakai SQLite `:memory:`, data resep simulasi, HTTP fake, dan pemblokiran 
 
 ## Rollback development
 
-Perintah berikut menghapus paket, pembayaran, masa aktif, kuota harian dan tautan kuota pada operasi rekomendasi. Gunakan hanya pada **salinan SQLite development** yang boleh kehilangan data fitur tersebut. Pastikan migration Premium adalah migration terbaru dengan `migrate:status`. Akun, favorit, riwayat dan operasi lama dipertahankan. Untuk mempertahankan data billing, gunakan backup konsisten dan pulihkan bersama versi aplikasi yang sesuai.
+Perintah berikut menghapus paket, pembayaran, masa aktif, kuota harian dan tautan kuota pada operasi rekomendasi. Gunakan hanya pada **salinan SQLite development** yang boleh kehilangan data fitur tersebut. Tabel refund dan periode bergantung pada tabel pembayaran, jadi migration-nya dibatalkan lebih dulu; langkah itu menghapus riwayat refund dan peninjauan. Akun, favorit, riwayat dan operasi lama dipertahankan. Untuk mempertahankan data billing, gunakan backup konsisten dan pulihkan bersama versi aplikasi yang sesuai.
 
 ```sh
+php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_22_000001_create_payment_reversal_tables.php
 php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_000001_create_premium_tables.php
 ```
 
@@ -104,6 +138,7 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `app/Http/Requests/MidtransNotificationRequest.php` (baru)
 - `app/Http/Requests/PaymentStatusRequest.php` (baru)
 - `app/Services/MidtransSandboxService.php` (baru)
+- `app/Services/PaymentAdjustmentService.php` (baru)
 - `app/Services/QuotaService.php` (baru)
 - `app/Services/RecommendationOperationService.php` (diubah)
 - `app/Services/SubscriptionService.php` (baru)
@@ -111,6 +146,7 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `bootstrap/app.php` (diubah)
 - `config/midtrans.php` (baru)
 - `database/migrations/2026_11_21_000001_create_premium_tables.php` (baru)
+- `database/migrations/2026_11_22_000001_create_payment_reversal_tables.php` (baru)
 - `docs/premium-sandbox.md` (baru)
 - `resources/js/app.js` (diubah)
 - `resources/views/account/required.blade.php` (diubah)
@@ -126,6 +162,7 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `resources/views/subscription/show.blade.php` (baru)
 - `routes/console.php` (diubah)
 - `routes/web.php` (diubah)
+- `tests/Feature/PaymentReversalTest.php` (baru)
 - `tests/Feature/PremiumSubscriptionTest.php` (baru)
 
 Migration juga memperbarui skema SQLite development lokal di `database/database.sqlite`. Vite menghasilkan aset lokal di `public/build/`. Keduanya berada di luar Git.
