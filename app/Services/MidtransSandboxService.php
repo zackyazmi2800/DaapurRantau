@@ -120,6 +120,78 @@ class MidtransSandboxService
         }
     }
 
+    public function reconcile(?string $order = null, int $limit = 20): array
+    {
+        if (! $this->ready()) {
+            return ['inactive' => 1];
+        }
+        $query = DB::table('payments')->whereIn('status', ['pending', 'review']);
+        if ($order !== null) {
+            $query->where('order_id', $order);
+        } else {
+            $query->where('created_at', '<=', now()->subMinutes(10))
+                ->where(fn ($query) => $query->where('status', 'review')->orWhere('created_at', '>=', now()->subDays(7)))
+                ->where(fn ($query) => $query->where('updated_at', '<=', now()->subHour())
+                    ->orWhere(fn ($query) => $query->where('created_at', '>', now()->subHours(2))->where('updated_at', '<=', now()->subMinutes(10))));
+        }
+        $counts = [];
+        $failures = 0;
+        $started = microtime(true);
+        foreach ($query->orderBy('updated_at')->orderBy('id')->limit($limit)->get() as $payment) {
+            if ($failures >= 3 || microtime(true) - $started > 40) {
+                break;
+            }
+            try {
+                try {
+                    $outcome = $this->reconcilePayment($payment);
+                    $failures = 0;
+                } catch (HttpException $exception) {
+                    $outcome = 'unverified';
+                    $failures += $exception->getStatusCode() === 503 ? 1 : 0;
+                    $this->touch($payment);
+                }
+            } catch (Throwable $exception) {
+                if (SqliteContention::isBusy($exception)) {
+                    $counts['busy'] = 1;
+                    break;
+                }
+                report($exception);
+                rescue(fn () => $this->touch($payment), report: false);
+                $outcome = 'error';
+                $failures++;
+            }
+            $counts[$outcome] = ($counts[$outcome] ?? 0) + 1;
+        }
+
+        return $counts;
+    }
+
+    private function reconcilePayment(object $payment): string
+    {
+        if ($payment->status === 'review' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
+            $this->touch($payment);
+
+            return 'review';
+        }
+        $status = $this->refresh($payment);
+        if ($status === null && $payment->status === 'pending' && $payment->created_at <= now()->subHours(48)->toDateTimeString()) {
+            DB::table('payments')->where('id', $payment->id)->where('status', 'pending')
+                ->update(['status' => 'expired', 'updated_at' => now()]);
+
+            return 'expired';
+        }
+        if ($status === null || $status === $payment->status) {
+            $this->touch($payment);
+        }
+
+        return $status ?? 'unrecorded';
+    }
+
+    private function touch(object $payment): void
+    {
+        DB::table('payments')->where('id', $payment->id)->where('status', $payment->status)->update(['updated_at' => now()]);
+    }
+
     private function refresh(object $payment): ?string
     {
         if ($payment->status === 'paid') {
