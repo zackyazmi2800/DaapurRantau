@@ -75,9 +75,10 @@ class SubscriptionService
         return true;
     }
 
-    public function restore(int $paymentId): bool
+    public function restore(int $paymentId, bool $revoked = false): bool
     {
-        $period = DB::table('subscription_periods')->where('payment_id', $paymentId)->where('status', 'suspended')->first();
+        $period = DB::table('subscription_periods')->where('payment_id', $paymentId)
+            ->whereIn('status', $revoked ? ['suspended', 'revoked'] : ['suspended'])->first();
         if (! $period) {
             return false;
         }

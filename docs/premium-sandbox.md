@@ -80,6 +80,10 @@ php artisan payments:review <id-pembayaran> --revoke --confirm
 
 `--restore` menutup peninjauan sebagai `rejected`: periode yang ditangguhkan dipulihkan dengan menambahkan `held_seconds` ke akhir masa aktif, satu kali, dan pembayaran `chargeback` kembali `paid`. `--revoke` menutupnya sebagai `resolved`: sisa periode dicabut, dan pembayaran yang dibatalkan Midtrans menjadi `failed`. Refund penuh tidak dapat dipulihkan.
 
+Keduanya ditolak tanpa mengubah apa pun jika pembayaran tidak memiliki periode Premium yang tercatat; peninjauan tetap terbuka. Periode yang sudah dicabut tidak dapat dipulihkan dengan `--restore`, kecuali ada settlement baru yang sedang ditinjau.
+
+Jika Midtrans menyatakan settlement lagi untuk pembayaran yang periodenya sudah dicabut atau yang pernah memiliki penyesuaian, pembayaran tidak kembali `paid` dan Premium tidak aktif otomatis. Settlement itu dicatat sebagai peninjauan terbuka: `--restore` mengaktifkan kembali periode yang sama dan pembayaran menjadi `paid`; `--revoke` menutupnya tanpa perubahan.
+
 Midtrans tidak dapat me-refund Virtual Account. Setelah dana ditransfer manual ke pelanggan, catat dengan perintah berikut. Perintah ini tidak mengirim uang dan tidak menghubungi Midtrans.
 
 ```sh

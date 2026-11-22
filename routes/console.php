@@ -45,23 +45,14 @@ Artisan::command('payments:review {payment : ID pembayaran} {--restore} {--revok
 
         return 1;
     }
-    $open = DB::table('payment_adjustments')->where('payment_id', $payment->id)->where('status', 'pending_review')->count();
-    $plan = $this->option('restore') ? 'Premium dari pembayaran ini dipertahankan atau dipulihkan' : 'sisa Premium dari pembayaran ini dicabut';
-    if ($open === 0 || ! $this->option('confirm')) {
-        $this->line($open === 0 ? 'Tidak ada peninjauan terbuka untuk pembayaran ini.' : "DRY-RUN, belum ada perubahan. Rencana: menutup {$open} peninjauan; {$plan}. Tambahkan --confirm untuk menjalankan.");
-
-        return 0;
-    }
     try {
-        $closed = $adjustments->close($payment, (bool) $this->option('restore'));
+        [$ok, $message] = $adjustments->close($payment, (bool) $this->option('restore'), (bool) $this->option('confirm'));
     } catch (Throwable $exception) {
-        SqliteContention::isBusy($exception) ? $this->error('Database sedang sibuk. Tidak ada perubahan, coba lagi.') : throw $exception;
-
-        return 1;
+        [$ok, $message] = SqliteContention::isBusy($exception) ? [false, 'Database sedang sibuk. Tidak ada perubahan, coba lagi.'] : throw $exception;
     }
-    $this->line($closed === 0 ? 'Tidak ada peninjauan terbuka untuk pembayaran ini.' : "Ditutup: {$closed} peninjauan; {$plan}.");
+    $ok ? $this->line($message) : $this->error($message);
 
-    return 0;
+    return $ok ? 0 : 1;
 })->purpose('Tutup peninjauan refund atau chargeback sebuah pembayaran');
 
 Schedule::command('payments:reconcile')->everyFiveMinutes()->withoutOverlapping(10);

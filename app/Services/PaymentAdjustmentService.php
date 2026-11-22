@@ -15,10 +15,10 @@ class PaymentAdjustmentService
             DB::table('users')->where('id', $payment->user_id)->update(['id' => DB::raw('id')]);
             $current = DB::table('payments')->where('id', $payment->id)->value('status');
             $key = ['payment_id' => $payment->id, 'source' => $source, 'reference' => $reference];
-            if ($current === 'refunded' || DB::table('payment_adjustments')->where($key)->exists()) {
+            $settled = in_array($current, ['paid', 'chargeback'], true);
+            if ($current === 'refunded' || ($kind === 'settlement' && $settled) || DB::table('payment_adjustments')->where($key)->exists()) {
                 return ['unchanged', null];
             }
-            $settled = in_array($current, ['paid', 'chargeback'], true);
             $untracked = $settled && ! DB::table('subscription_periods')->where('payment_id', $payment->id)->exists();
             $status = $kind === 'refund' && ! $untracked ? 'resolved' : 'pending_review';
             $now = now();
@@ -31,7 +31,7 @@ class PaymentAdjustmentService
             if (in_array($kind, ['refund', 'chargeback'], true)) {
                 DB::table('payments')->where('id', $payment->id)->update(['status' => $kind === 'refund' ? 'refunded' : 'chargeback', 'updated_at' => $now]);
             }
-            if ($kind !== 'partial_refund') {
+            if (! in_array($kind, ['partial_refund', 'settlement'], true)) {
                 $this->subscriptions->withdraw($payment->id, $kind === 'refund' ? 'revoked' : 'suspended');
             }
 
@@ -42,40 +42,67 @@ class PaymentAdjustmentService
             }, $status];
         }, 3);
         if ($status !== null) {
-            Log::warning('payment.adjustment', ['payment_id' => $payment->id, 'kind' => $kind, 'source' => $source, 'status' => $status]);
+            DB::afterCommit(fn () => Log::warning('payment.adjustment', ['payment_id' => $payment->id, 'kind' => $kind, 'source' => $source, 'status' => $status]));
         }
 
         return $outcome;
     }
 
-    public function close(object $payment, bool $restore): int
+    public function close(object $payment, bool $restore, bool $confirm): array
     {
-        $closed = DB::transaction(function () use ($payment, $restore) {
+        $plan = fn () => $this->planClose($payment->id, $restore, $confirm);
+        [$ok, $message, $closed] = $confirm ? DB::transaction(function () use ($payment, $plan) {
             DB::table('users')->where('id', $payment->user_id)->update(['id' => DB::raw('id')]);
-            $open = DB::table('payment_adjustments')->where('payment_id', $payment->id)->where('status', 'pending_review');
-            $kinds = $open->pluck('kind');
-            if ($kinds->isEmpty()) {
-                return 0;
-            }
-            $now = now();
-            $open->update(['status' => $restore ? 'rejected' : 'resolved', 'updated_at' => $now]);
-            if ($restore) {
-                $this->subscriptions->restore($payment->id);
-                DB::table('payments')->where('id', $payment->id)->where('status', 'chargeback')->update(['status' => 'paid', 'updated_at' => $now]);
-            } else {
-                $this->subscriptions->withdraw($payment->id, 'revoked');
-                if ($kinds->contains('reversal')) {
-                    DB::table('payments')->where('id', $payment->id)->where('status', 'paid')->update(['status' => 'failed', 'updated_at' => $now]);
-                }
-            }
 
-            return $kinds->count();
-        }, 3);
+            return $plan();
+        }, 3) : $plan();
         if ($closed > 0) {
-            Log::warning('payment.review_closed', ['payment_id' => $payment->id, 'decision' => $restore ? 'restore' : 'revoke', 'closed' => $closed]);
+            DB::afterCommit(fn () => Log::warning('payment.review_closed', ['payment_id' => $payment->id, 'decision' => $restore ? 'restore' : 'revoke', 'closed' => $closed]));
         }
 
-        return $closed;
+        return [$ok, $message];
+    }
+
+    private function planClose(int $paymentId, bool $restore, bool $confirm): array
+    {
+        $open = DB::table('payment_adjustments')->where('payment_id', $paymentId)->where('status', 'pending_review');
+        $kinds = $open->pluck('kind');
+        if ($kinds->isEmpty()) {
+            return [true, 'Tidak ada peninjauan terbuka untuk pembayaran ini.', 0];
+        }
+        $period = DB::table('subscription_periods')->where('payment_id', $paymentId)->value('status');
+        if ($period === null) {
+            return [false, 'Tidak ada periode Premium yang tercatat untuk pembayaran ini. Peninjauan tetap terbuka dan tidak ada yang diubah.', 0];
+        }
+        $resettled = $kinds->contains('settlement');
+        if ($restore && $period === 'revoked' && ! $resettled) {
+            return [false, 'Periode Premium pembayaran ini sudah dicabut dan tidak dapat dipulihkan. Peninjauan tetap terbuka dan tidak ada yang diubah.', 0];
+        }
+        $count = $kinds->count();
+        $plan = match (true) {
+            $restore && $period === 'active' => 'Premium dari pembayaran ini dipertahankan',
+            $restore => 'Premium dari pembayaran ini dipulihkan',
+            $period === 'revoked' => 'periode Premium pembayaran ini sudah dicabut sebelumnya',
+            default => 'sisa Premium dari pembayaran ini dicabut',
+        };
+        if (! $confirm) {
+            return [true, "DRY-RUN, belum ada perubahan. Rencana: menutup {$count} peninjauan; {$plan}. Tambahkan --confirm untuk menjalankan.", 0];
+        }
+        $now = now();
+        (clone $open)->where('kind', 'settlement')->update(['status' => $restore ? 'resolved' : 'rejected', 'updated_at' => $now]);
+        $open->update(['status' => $restore ? 'rejected' : 'resolved', 'updated_at' => $now]);
+        if ($restore) {
+            $this->subscriptions->restore($paymentId, $resettled);
+            DB::table('payments')->where('id', $paymentId)->whereIn('status', $resettled ? ['chargeback', 'failed'] : ['chargeback'])
+                ->update(['status' => 'paid', 'updated_at' => $now]);
+        } else {
+            $this->subscriptions->withdraw($paymentId, 'revoked');
+            if ($kinds->contains('reversal')) {
+                DB::table('payments')->where('id', $paymentId)->where('status', 'paid')->update(['status' => 'failed', 'updated_at' => $now]);
+            }
+        }
+
+        return [true, "Ditutup: {$count} peninjauan; {$plan}.", $count];
     }
 
     public function manualRefund(int $paymentId, mixed $amount, mixed $reason, mixed $reference, bool $confirm): array

@@ -321,8 +321,14 @@ class MidtransSandboxService
         if ($status === 'paid' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
             $status = 'review';
         }
-        $changed = DB::transaction(function () use ($payment, $status) {
+        $review = null;
+        $changed = DB::transaction(function () use ($payment, $status, &$review) {
+            $review = null;
             $query = DB::table('payments')->where('id', $payment->id)->whereNotIn('status', ['paid', 'refunded', 'chargeback']);
+            if ($status === 'paid') {
+                $query->whereNotExists(fn ($query) => $query->from('subscription_periods')->whereColumn('subscription_periods.payment_id', 'payments.id'))
+                    ->whereNotExists(fn ($query) => $query->from('payment_adjustments')->whereColumn('payment_adjustments.payment_id', 'payments.id'));
+            }
             if ($status === 'pending') {
                 $query->where('status', 'pending');
             }
@@ -333,14 +339,18 @@ class MidtransSandboxService
             if ($changed && $status === 'paid') {
                 $this->subscriptions->extend($payment);
             }
+            if (! $changed && $status === 'paid'
+                && ! in_array(DB::table('payments')->where('id', $payment->id)->value('status'), ['paid', 'refunded', 'chargeback'], true)) {
+                $review = $this->adjustments->record($payment, 'settlement', 'midtrans', null, 'settlement');
+            }
 
             return $changed;
         }, 3);
         if ($changed && $status === 'review') {
-            Log::warning('payment.review', ['payment_id' => $payment->id, 'plan_id' => $payment->plan_id]);
+            DB::afterCommit(fn () => Log::warning('payment.review', ['payment_id' => $payment->id, 'plan_id' => $payment->plan_id]));
         }
 
-        return $changed ? $status : null;
+        return $changed ? $status : ($review === 'unchanged' ? null : $review);
     }
 
     private function paymentStatus(array $data): string
