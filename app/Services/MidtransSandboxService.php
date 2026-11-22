@@ -16,7 +16,7 @@ use Throwable;
 
 class MidtransSandboxService
 {
-    public function __construct(private SubscriptionService $subscriptions) {}
+    public function __construct(private SubscriptionService $subscriptions, private PaymentAdjustmentService $adjustments) {}
 
     public function ready(): bool
     {
@@ -86,7 +86,9 @@ class MidtransSandboxService
         $payment = DB::table('payments')->where('order_id', $order)->first();
         abort_unless($payment, 404);
         abort_unless($this->matchesAmount($notice['gross_amount'], $payment->amount), 422);
-        if ($payment->status === 'paid') {
+        $settled = in_array($payment->status, ['paid', 'chargeback'], true);
+        $reversing = in_array($notice['transaction_status'], ['refund', 'partial_refund', 'chargeback', 'partial_chargeback', 'deny', 'cancel', 'expire', 'failure'], true);
+        if ($payment->status === 'refunded' || ($settled && ! $reversing)) {
             return;
         }
 
@@ -95,14 +97,13 @@ class MidtransSandboxService
         abort_if($current === null, 503, 'Status pembayaran belum dapat diverifikasi.');
 
         // A delayed notification may differ from the current gateway state.
-        $status = $this->paymentStatus($current);
-        if ($status === 'paid' && $this->paymentStatus($notice) !== 'paid') {
+        if (! $settled && $this->adjustment($payment, $current) === null && $this->paymentStatus($current) === 'paid' && $this->paymentStatus($notice) !== 'paid') {
             // A stale or challenged notice cannot grant access.
             return;
         }
 
         try {
-            $this->apply($payment, $status);
+            $this->settle($payment, $current);
         } catch (Throwable $exception) {
             if ($exception instanceof HttpException || SqliteContention::isBusy($exception)) {
                 throw $exception;
@@ -249,9 +250,50 @@ class MidtransSandboxService
         if ($current === null) {
             return null;
         }
-        $applied = $this->apply($payment, $this->paymentStatus($current));
+        $applied = $this->settle($payment, $current);
 
         return DB::table('payments')->where('id', $payment->id)->value('status');
+    }
+
+    private function settle(object $payment, array $current): ?string
+    {
+        $adjustment = $this->adjustment($payment, $current);
+        if ($adjustment === null) {
+            return in_array($payment->status, ['paid', 'chargeback'], true) ? null : $this->apply($payment, $this->paymentStatus($current));
+        }
+        $outcome = $this->adjustments->record($payment, ...$adjustment);
+
+        return $outcome === 'unchanged' ? null : $outcome;
+    }
+
+    private function adjustment(object $payment, array $current): ?array
+    {
+        $status = $current['transaction_status'] ?? null;
+        $settled = in_array($payment->status, ['paid', 'chargeback'], true);
+        $kind = match (true) {
+            in_array($status, ['refund', 'chargeback'], true) => $status,
+            $settled && in_array($status, ['partial_refund', 'partial_chargeback'], true) => $status,
+            $settled && in_array($status, ['deny', 'cancel', 'expire', 'failure'], true) => 'reversal',
+            default => null,
+        };
+        if ($kind === null) {
+            return null;
+        }
+        $amount = $kind === 'refund' ? (int) $payment->amount : null;
+        $reason = null;
+        if ($kind === 'partial_refund') {
+            $refunded = $current['refund_amount'] ?? null;
+            abort_unless(is_numeric($refunded) && (float) $refunded > 0 && (float) $refunded < $payment->amount, 422);
+            $amount = (int) round((float) $refunded);
+            $last = collect($current['refunds'] ?? [])->last();
+            $reason = is_array($last) && is_string($last['reason'] ?? null) && $last['reason'] !== '' ? mb_substr($last['reason'], 0, 255) : null;
+        }
+
+        return [$kind, 'midtrans', $amount, match ($kind) {
+            'partial_refund' => "partial_refund:{$amount}",
+            'reversal' => "reversal:{$status}",
+            default => $kind,
+        }, $reason];
     }
 
     private function currentStatus(object $payment): ?array
@@ -280,7 +322,7 @@ class MidtransSandboxService
             $status = 'review';
         }
         $changed = DB::transaction(function () use ($payment, $status) {
-            $query = DB::table('payments')->where('id', $payment->id)->where('status', '!=', 'paid');
+            $query = DB::table('payments')->where('id', $payment->id)->whereNotIn('status', ['paid', 'refunded', 'chargeback']);
             if ($status === 'pending') {
                 $query->where('status', 'pending');
             }

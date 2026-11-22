@@ -22,7 +22,8 @@ class SubscriptionController extends Controller
         $userId = $request->user()->id;
         $payments = DB::table('payments')->join('subscription_plans', 'subscription_plans.id', '=', 'payments.plan_id')
             ->where('payments.user_id', $userId)->orderByDesc('payments.id')
-            ->paginate(10, ['payments.order_id', 'payments.amount', 'payments.status', 'payments.created_at', 'subscription_plans.name']);
+            ->paginate(10, ['payments.order_id', 'payments.amount', 'payments.status', 'payments.created_at', 'subscription_plans.name',
+                DB::raw("exists (select 1 from payment_adjustments where payment_adjustments.payment_id = payments.id and payment_adjustments.status = 'pending_review') as disputed")]);
         $order = $request->query('bayar');
         $checkout = is_string($order) && $gateway->ready() ? DB::table('payments')->where(['order_id' => $order, 'user_id' => $userId, 'status' => 'pending'])->value('snap_token') : null;
 
@@ -48,6 +49,8 @@ class SubscriptionController extends Controller
             'failed' => ['Pembayaran gagal atau dibatalkan.', 'warning'],
             'expired' => ['Pembayaran telah kedaluwarsa.', 'warning'],
             'review' => ['Pembayaran diterima dan sedang ditinjau. Premium aktif setelah peninjauan selesai.', 'info'],
+            'refunded' => ['Dana pembayaran ini telah dikembalikan.', 'warning'],
+            'chargeback' => ['Pembayaran ini sedang ditinjau.', 'warning'],
             'busy' => ['Sistem sedang sibuk. Status belum berubah, coba lagi sebentar.', 'warning'],
             'error' => ['Pembayaran belum dapat diproses. Status belum berubah, silakan coba kembali.', 'error'],
             null => ['Transaksi belum tercatat di Midtrans. Selesaikan pembayaran terlebih dahulu.', 'info'],

@@ -13,7 +13,7 @@ class MidtransNotificationRequest extends FormRequest
             'gross_amount' => ['required', 'string', 'max:20'],
             'status_code' => ['required', 'string', 'digits:3'],
             'signature_key' => ['required', 'string', 'size:128'],
-            'transaction_status' => ['required', 'string', 'in:pending,authorize,capture,settlement,cancel,deny,expire,failure'],
+            'transaction_status' => ['required', 'string', 'in:pending,authorize,capture,settlement,cancel,deny,expire,failure,refund,partial_refund,chargeback,partial_chargeback'],
             'fraud_status' => ['sometimes', 'string', 'in:accept,challenge,deny'],
         ];
     }

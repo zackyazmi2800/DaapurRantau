@@ -23,7 +23,7 @@
         @forelse ($payments as $payment)
             <li class="flex flex-wrap justify-between gap-3 py-4">
                 <div><strong>{{ $payment->name }}</strong><p class="text-sm text-muted">{{ \Illuminate\Support\Carbon::parse($payment->created_at, 'UTC')->timezone('Asia/Jakarta')->format('d/m/Y H:i') }} WIB · Rp{{ number_format($payment->amount, 0, ',', '.') }}</p></div>
-                <div>{{ ['pending' => 'Menunggu pembayaran', 'paid' => 'Berhasil', 'failed' => 'Gagal', 'expired' => 'Kedaluwarsa', 'review' => 'Sedang ditinjau'][$payment->status] }}
+                <div>{{ $payment->disputed ? 'Sedang ditinjau' : ['pending' => 'Menunggu pembayaran', 'paid' => 'Berhasil', 'failed' => 'Gagal', 'expired' => 'Kedaluwarsa', 'review' => 'Sedang ditinjau', 'refunded' => 'Dana dikembalikan', 'chargeback' => 'Dibatalkan bank'][$payment->status] }}
                     @if ($payment->status === 'pending')
                         <a class="block text-primary underline" href="{{ route('subscription.show', ['bayar' => $payment->order_id]) }}">Lanjutkan pembayaran</a>
                         <form method="POST" action="{{ route('subscription.sync') }}">
