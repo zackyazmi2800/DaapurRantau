@@ -1,1 +1,1 @@
-<p class="mt-5 max-w-2xl text-sm leading-7 text-muted">Tanpa akun, kamu bisa mencari resep hingga 3 kali berhasil, tetapi belum bisa menyimpan favorit atau riwayat. Masuk dengan email atau Google untuk menyimpan favorit dan riwayat pencarian di akunmu.</p>
+<p class="mt-5 max-w-2xl text-sm leading-7 text-muted">Koleksi ini tersimpan di akunmu dan dapat dibuka selama Premium aktif.</p>

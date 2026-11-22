@@ -1,6 +1,8 @@
 # Dapur Rantau
 
-Platform ide masakan praktis dan hemat untuk mahasiswa, anak kos, dan perantau. Pengguna memasukkan bahan, mendapatkan tepat tiga resep pada pencarian yang berhasil dari Google Gemini, membaca detail, menyimpan favorit, dan melihat riwayat pencarian tanpa login.
+Platform ide masakan praktis dan hemat untuk mahasiswa, anak kos, dan perantau. Pengguna memasukkan bahan, mendapatkan tepat tiga resep pada pencarian yang berhasil dari Google Gemini, dan membaca detail. Akun Premium juga dapat menyimpan favorit dan membuka riwayat.
+
+Panduan development mencakup [setup Midtrans Sandbox, migration, rollback, dan checklist Premium](docs/premium-sandbox.md).
 
 ## Fitur
 
@@ -8,7 +10,7 @@ Platform ide masakan praktis dan hemat untuk mahasiswa, anak kos, dan perantau. 
 - Rekomendasi JSON tervalidasi, pencocokan bahan deterministik, urutan resep paling sesuai, detail dengan checkbox bahan/langkah.
 - Cache Gemini 24 jam, snapshot halaman privat 60 menit, limiter dan proteksi concurrent request.
 - Kartu rekomendasi, detail dan favorit berbasis teks tanpa gambar resep atau layanan gambar eksternal.
-- Favorit dari snapshot server, deduplikasi per pengunjung, detail database tanpa Gemini.
+- Favorit dari snapshot server, deduplikasi per akun Premium, detail database tanpa Gemini.
 - Riwayat 30 pencarian terakhir, termasuk cache hit; ulang input, hapus satu/semua dengan konfirmasi.
 - Blade responsif, CSRF, escaping output, pembatasan kepemilikan dan error berbahasa Indonesia.
 
@@ -105,7 +107,7 @@ Alternatif tanpa dev server: `npm run build`. Layout memakai @vite; Tailwind men
 
 ## Alur resep, cache, token dan limiter
 
-POST /rekomendasi → Form Request → GeminiRecipeService → cache/API → validasi → matching → snapshot privat dan history. Favorit disimpan dari ID snapshot/recipe yang diverifikasi server, bukan JSON browser. GET hasil/detail/favorit/riwayat tidak menghasilkan request Gemini.
+POST /rekomendasi → Form Request → GeminiRecipeService → cache/API → validasi → matching → snapshot privat, pencatatan kuota dan riwayat Premium. Favorit disimpan dari ID snapshot/recipe yang diverifikasi server, bukan JSON browser. GET hasil/detail/favorit/riwayat tidak menghasilkan request Gemini.
 
 - generateContent REST memakai systemInstruction, satu input JSON, responseMimeType application/json dan responseJsonSchema. Model tetap dapat dikonfigurasi; thinking MINIMAL, output 3000 token, sampling default. Tidak ada riwayat chat atau request terpisah per resep.
 - Schema generation mempertahankan tipe/field/enum dan tepat 3 resep (`minItems: 3`, `maxItems: 3`). Batas numeric/array internal ditegakkan validator backend secara ketat (waktu 1–1440, porsi 1–10, bahan 1–30, langkah 1–8). Pendekatan ini memperbaiki HTTP400 schema sebelumnya; prompt_version=5, schema_version=3. Jangan mengembalikan schema generation lama tanpa bukti kompatibilitas.
@@ -117,11 +119,9 @@ POST /rekomendasi → Form Request → GeminiRecipeService → cache/API → val
 - Connect timeout 5 detik, request timeout 30 detik (maksimum config 60). Maksimal satu retry tambahan hanya HTTP500/503, dengan Retry-After <=2 detik; delay lebih lama tidak diulang lebih awal. Tidak retry timeout/connection error/429/RESOURCE_EXHAUSTED/QuotaFailure, JSON rusak/terpotong, alergi, atau error akses/input/model. Hasil dengan nama bahan gabungan boleh dikoreksi sekali dalam batas total dua panggilan; jumlah tambahan tidak memicu koreksi. Tidak ada kenaikan token otomatis.
 - Log mencatat metrik model, token numerik/null, status, durasi, cache hit/miss dan diagnostik yang diizinkan. Key, prompt, input alergi dan raw provider body tidak dicatat.
 
-## Identitas anonim dan batasan
+## Identitas dan akses koleksi
 
-Visitor UUID dibuat server dan disimpan session, bukan dari IP atau request input. Semua query favorit/riwayat menyertakan visitor_id. Fingerprint + unique index per visitor mencegah resep identik ganda. Favorit menyimpan recipe_data saja; riwayat menyimpan bahan/porsi/preferensi/jumlah hasil dan pointer snapshot, tanpa alergi atau respons provider lengkap.
-
-Sesi/cookie hilang, browser berganti atau perangkat berbeda dapat membuat data tidak bisa diakses lagi. Tidak ada akun, sinkronisasi atau pemulihan. Kebijakan pembersihan data yatim belum diimplementasikan. Alergi perlu diisi kembali melalui Cari Lagi. Hapus history tidak menghapus favorit atau cache Gemini bersama.
+Guest memakai identitas cookie yang dibuat server dan memiliki tiga pencarian berhasil. Login email terverifikasi atau Google mengaitkan pencarian baru dengan akun. Batas akun Free adalah satu pencarian berhasil per hari WIB, sedangkan Premium mendapat 30. Semua rute favorit dan riwayat memeriksa Premium dan membatasi data berdasarkan akun sesi. Data lama tetap disimpan saat paket berakhir.
 
 Matching nama utuh memakai alias terkontrol (cabe/cabai, garlic/bawang putih), bukan substring. Telur tidak otomatis sama dengan telur ayam. Kesesuaian tidak menghitung kecukupan takaran dan bukan jaminan keamanan alergen/turunannya. Checkbox hanya UI, tidak persisten. POST hasil masih langsung menampilkan halaman; refresh POST bisa meminta submit ulang, dilindungi limiter/cache.
 
@@ -154,7 +154,7 @@ Live Gemini **sudah berhasil pada Step 5** dengan JSON resep valid dan cache hit
 | 500/503/timeout provider | Pesan aman tampil; retry hanya sesuai aturan di atas. Coba nanti, tanpa loop request. |
 | Tidak ada tabel cache/session/koleksi | Periksa koneksi DB lalu php artisan migrate; jangan reset database. |
 | 419 | Buka ulang halaman; periksa hostname, HTTPS, domain cookie dan session storage. |
-| Favorit/riwayat kosong setelah browser berubah | Data berbasis session anonim, bukan akun. |
+| Favorit/riwayat kosong setelah browser berubah | Masuk dengan akun pemilik koleksi dan periksa masa aktif Premium. |
 | Snapshot tidak tersedia | Cari Lagi memulihkan input; hasil lama hanya bertahan 60 menit. |
 | CSS/JS tidak ter-load | Periksa Node, npm run build atau dev server, public/hot dan document root public/. |
 | SQLite terkunci/permission | Periksa izin direktori database dan file, storage serta bootstrap/cache; jangan chmod777. |
