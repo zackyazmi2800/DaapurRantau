@@ -19,6 +19,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\View;
 use Illuminate\Support\Str;
@@ -347,7 +348,9 @@ class PremiumSubscriptionTest extends TestCase
         foreach ($failures as $index => $failure) {
             $response = $index % 2
                 ? $this->postJson('/langganan/checkout', ['plan' => 'weekly'])->assertExactJson(['message' => 'Checkout belum tersedia. Silakan coba kembali.'])
-                : $this->post('/langganan/checkout', ['plan' => 'weekly']);
+                : $this->post('/langganan/checkout', ['plan' => 'weekly'])->assertSee('aria-label="Dapur Rantau, beranda"', false)
+                    ->assertSee('<h1 class="section-title">Pembayaran belum dapat diproses</h1>', false)->assertSee('Silakan coba kembali beberapa saat lagi.')
+                    ->assertSee('href="'.route('pricing').'"', false)->assertSee('href="'.route('subscription.show').'"', false)->assertDontSee('Service Unavailable');
             $response->assertServiceUnavailable()->assertDontSee('leaked-snap-token')->assertDontSee('fixture-gateway-detail')->assertDontSee('SB-Mid-server-');
             $this->assertDatabaseCount('payments', $index + 1);
         }
@@ -357,6 +360,17 @@ class PremiumSubscriptionTest extends TestCase
             ->assertDontSee('snap.js')->assertDontSee('data-snap-checkout', false)->assertDontSee('Lanjutkan pembayaran')->assertDontSee('Perbarui status');
         Http::assertSentCount(4);
         $this->assertSame([], $logged->getArrayCopy());
+
+        DB::enableQueryLog();
+        Route::get('/uji-503', fn () => abort(503, 'fixture-raw-detail'));
+        $this->get('/uji-503')->assertServiceUnavailable()->assertSee('<h1 class="section-title">Layanan belum tersedia</h1>', false)
+            ->assertSee('href="'.route('home').'"', false)->assertDontSee('Pembayaran')->assertDontSee('fixture-raw-detail');
+        $this->assertSame([], DB::getQueryLog());
+        DB::disableQueryLog();
+        config(['midtrans.is_production' => true]);
+        $notice = ['order_id' => (string) Str::uuid(), 'gross_amount' => '5000.00', 'status_code' => '200', 'transaction_status' => 'settlement', 'signature_key' => str_repeat('0', 128)];
+        $this->call('POST', '/api/midtrans/notification', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode($notice))
+            ->assertServiceUnavailable()->assertHeader('Content-Type', 'application/json')->assertExactJson(['message' => '']);
     }
 
     public function test_reconciliation_stays_idle_without_a_usable_sandbox_and_survives_gateway_outage(): void
