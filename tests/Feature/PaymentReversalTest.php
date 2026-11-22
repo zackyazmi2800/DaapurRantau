@@ -353,6 +353,71 @@ class PaymentReversalTest extends TestCase
         $this->assertDatabaseCount('subscriptions', 2);
     }
 
+    public function test_manual_refund_command_records_only_confirmed_transfers_once(): void
+    {
+        $user = User::factory()->create();
+        [$a, $b] = [$this->pay($user), $this->pay($user)];
+        $unpaid = $this->order($user, 'weekly', 'failed');
+        $this->travel(1)->days();
+        $sent = Http::recorded()->count();
+        $before = $this->snapshot();
+        $refund = fn (object $payment, array $options) => $this->artisan('payments:refund', $options + ['payment' => $payment->id]);
+        $transfer = ['--reason' => 'Permintaan pengguna', '--reference' => 'TRF-1'];
+
+        $refund($a, [])->assertFailed();
+        $refund($a, ['--amount' => '2000'])->assertFailed();
+        $refund($a, ['--amount' => '2000', '--reason' => 'Permintaan pengguna'])->assertFailed();
+        $refund($a, ['--amount' => '2000', '--reference' => 'TRF-1'])->assertFailed();
+        foreach (['0', '-5', 'abc', '20.5', ''] as $invalid) {
+            $refund($a, ['--amount' => $invalid, '--confirm' => true] + $transfer)->assertFailed();
+        }
+        $refund($a, ['--amount' => '5001', '--confirm' => true] + $transfer)->expectsOutputToContain('melebihi')->assertFailed();
+        $refund($unpaid, ['--amount' => '5000', '--confirm' => true] + $transfer)->expectsOutputToContain('paid')->assertFailed();
+        $this->artisan('payments:refund', ['payment' => 999, '--amount' => '5000', '--confirm' => true] + $transfer)->assertFailed();
+        $refund($a, ['--amount' => '2000'] + $transfer)->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        $refund($a, ['--amount' => '5000'] + $transfer)->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        $this->assertSame($before, $this->snapshot());
+        $this->assertDatabaseCount('payment_adjustments', 0);
+
+        $refund($a, ['--amount' => '2000', '--confirm' => true] + $transfer)->expectsOutputToContain('Dicatat')->assertSuccessful();
+        $this->assertSame('paid', $this->state($a));
+        $this->assertDatabaseHas('payment_adjustments', ['payment_id' => $a->id, 'kind' => 'partial_refund', 'source' => 'manual', 'status' => 'pending_review',
+            'amount' => 2000, 'reference' => 'TRF-1', 'reason' => 'Permintaan pengguna']);
+        $this->assertSame(['active', '2026-01-01 00:00:00', '2026-01-08 00:00:00', null], $this->period($a));
+        $this->assertSame('2026-01-15 00:00:00', $this->ends($user));
+        $partial = $this->snapshot();
+        $refund($a, ['--amount' => '2000', '--confirm' => true] + $transfer)->expectsOutputToContain('sudah dicatat')->assertSuccessful();
+        $refund($a, ['--amount' => '2000'] + $transfer)->expectsOutputToContain('sudah dicatat')->assertSuccessful();
+        $refund($a, ['--amount' => '3000', '--confirm' => true] + $transfer)->expectsOutputToContain('nominal berbeda')->assertFailed();
+        $refund($a, ['--amount' => '3001', '--confirm' => true, '--reference' => 'TRF-2'] + $transfer)->expectsOutputToContain('melebihi')->assertFailed();
+        $this->assertSame([], app(MidtransSandboxService::class)->reconcile());
+        $this->assertSame([], app(MidtransSandboxService::class)->reconcile($a->order_id));
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->assertSame($partial, $this->snapshot());
+
+        $refund($a, ['--amount' => '3000', '--confirm' => true, '--reference' => 'TRF-2'] + $transfer)->expectsOutputToContain('refund penuh')->assertSuccessful();
+        $this->assertSame(['refunded', 'paid'], [$this->state($a), $this->state($b)]);
+        $this->assertSame([['partial_refund', 'resolved', 2000], ['refund', 'resolved', 3000]],
+            DB::table('payment_adjustments')->orderBy('id')->get()->map(fn ($row) => [$row->kind, $row->status, $row->amount])->all());
+        $this->assertSame(['revoked', '2026-01-01 00:00:00', '2026-01-02 00:00:00', 518400], $this->period($a));
+        $this->assertSame(['active', '2026-01-02 00:00:00', '2026-01-09 00:00:00', null], $this->period($b));
+        $this->assertSame('2026-01-09 00:00:00', $this->ends($user));
+        $full = $this->snapshot();
+        $refund($a, ['--amount' => '3000', '--confirm' => true, '--reference' => 'TRF-2'] + $transfer)->expectsOutputToContain('sudah dicatat')->assertSuccessful();
+        $refund($a, ['--amount' => '1', '--confirm' => true, '--reference' => 'TRF-9'] + $transfer)->assertFailed();
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->assertSame([], app(MidtransSandboxService::class)->reconcile($a->order_id));
+        $this->assertSame($full, $this->snapshot());
+
+        $refund($b, ['--amount' => '5000', '--confirm' => true, '--reference' => 'TRF-3'] + $transfer)->assertSuccessful();
+        $this->assertSame('refunded', $this->state($b));
+        $this->assertSame(['revoked', '2026-01-02 00:00:00', '2026-01-02 00:00:00', 604800], $this->period($b));
+        $this->assertNull(app(SubscriptionService::class)->active($user->id));
+        $this->assertSame($sent, Http::recorded()->count());
+        $this->assertDatabaseCount('payments', 3);
+        $this->assertLogsAreSafe(['payment.adjustment']);
+    }
+
     public function test_migration_backfills_periods_only_when_paid_history_reproduces_the_subscription(): void
     {
         $migration = require database_path('migrations/2026_11_22_000001_create_payment_reversal_tables.php');

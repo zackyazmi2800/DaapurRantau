@@ -77,4 +77,58 @@ class PaymentAdjustmentService
 
         return $closed;
     }
+
+    public function manualRefund(int $paymentId, mixed $amount, mixed $reason, mixed $reference, bool $confirm): array
+    {
+        $payment = DB::table('payments')->where('id', $paymentId)->first();
+        if (! $payment) {
+            return [false, 'Pembayaran tidak ditemukan.'];
+        }
+        if (! is_string($amount) || ! ctype_digit($amount) || (int) $amount < 1 || strlen($amount) > 9) {
+            return [false, 'Opsi --amount wajib berupa bilangan bulat rupiah yang lebih dari nol.'];
+        }
+        if (! is_string($reason) || trim($reason) === '' || mb_strlen($reason) > 255) {
+            return [false, 'Opsi --reason wajib diisi (maksimal 255 karakter).'];
+        }
+        if (! is_string($reference) || trim($reference) === '' || mb_strlen($reference) > 100) {
+            return [false, 'Opsi --reference wajib diisi dengan referensi transfer (maksimal 100 karakter).'];
+        }
+        $amount = (int) $amount;
+        $reference = trim($reference);
+        $plan = fn () => $this->planManualRefund($payment->id, $amount, trim($reason), $reference, $confirm);
+
+        return $confirm ? DB::transaction(function () use ($payment, $plan) {
+            DB::table('users')->where('id', $payment->user_id)->update(['id' => DB::raw('id')]);
+
+            return $plan();
+        }, 3) : $plan();
+    }
+
+    private function planManualRefund(int $paymentId, int $amount, string $reason, string $reference, bool $confirm): array
+    {
+        $payment = DB::table('payments')->where('id', $paymentId)->first();
+        $manual = DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'manual']);
+        $recorded = (clone $manual)->where('reference', $reference)->first();
+        if ($recorded) {
+            return (int) $recorded->amount === $amount
+                ? [true, 'Referensi ini sudah dicatat untuk pembayaran tersebut. Tidak ada perubahan.']
+                : [false, 'Referensi ini sudah dicatat dengan nominal berbeda.'];
+        }
+        if ($payment->status !== 'paid') {
+            return [false, 'Hanya pembayaran berstatus paid yang dapat dicatat refund manualnya.'];
+        }
+        $total = (int) $manual->sum('amount') + $amount;
+        if ($total > $payment->amount) {
+            return [false, 'Total refund melebihi nominal pembayaran.'];
+        }
+        $full = $total === (int) $payment->amount;
+        $plan = $full ? 'refund penuh: pembayaran menjadi refunded dan sisa Premium dari pembayaran ini dicabut'
+            : 'refund sebagian: dicatat untuk ditinjau, masa aktif Premium tidak diubah';
+        if (! $confirm) {
+            return [true, "DRY-RUN, belum ada yang dicatat. Rencana: {$plan}. Jalankan ulang dengan --confirm hanya setelah transfer benar-benar dilakukan."];
+        }
+        $outcome = $this->record($payment, $full ? 'refund' : 'partial_refund', 'manual', $amount, $reference, $reason);
+
+        return $outcome === 'unchanged' ? [true, 'Sudah dicatat sebelumnya. Tidak ada perubahan.'] : [true, "Dicatat ({$plan})."];
+    }
 }

@@ -27,6 +27,17 @@ Artisan::command('payments:reconcile {--order=} {--limit=20}', function (Midtran
     return 0;
 })->purpose('Rekonsiliasi pembayaran pending dengan Midtrans Sandbox');
 
+Artisan::command('payments:refund {payment : ID pembayaran} {--amount=} {--reason=} {--reference=} {--confirm}', function (PaymentAdjustmentService $adjustments) {
+    try {
+        [$ok, $message] = $adjustments->manualRefund((int) $this->argument('payment'), $this->option('amount'), $this->option('reason'), $this->option('reference'), (bool) $this->option('confirm'));
+    } catch (Throwable $exception) {
+        [$ok, $message] = SqliteContention::isBusy($exception) ? [false, 'Database sedang sibuk. Tidak ada yang dicatat, coba lagi.'] : throw $exception;
+    }
+    $ok ? $this->line($message) : $this->error($message);
+
+    return $ok ? 0 : 1;
+})->purpose('Catat refund manual yang sudah ditransfer di luar Midtrans (tidak mengirim uang)');
+
 Artisan::command('payments:review {payment : ID pembayaran} {--restore} {--revoke} {--confirm}', function (PaymentAdjustmentService $adjustments) {
     $payment = DB::table('payments')->where('id', (int) $this->argument('payment'))->first();
     if (! $payment || $this->option('restore') === $this->option('revoke')) {
