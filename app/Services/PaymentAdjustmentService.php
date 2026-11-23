@@ -144,11 +144,12 @@ class PaymentAdjustmentService
         if ($payment->status !== 'paid') {
             return [false, 'Hanya pembayaran berstatus paid yang dapat dicatat refund manualnya.'];
         }
-        $total = (int) $manual->sum('amount') + $amount;
-        if ($total > $payment->amount) {
-            return [false, 'Total refund melebihi nominal pembayaran.'];
+        $gateway = (int) DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'kind' => 'partial_refund'])->max('amount');
+        $left = (int) $payment->amount - (int) $manual->sum('amount') - $gateway;
+        if ($amount > $left) {
+            return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.').'.'];
         }
-        $full = $total === (int) $payment->amount;
+        $full = $amount === $left;
         $plan = $full ? 'refund penuh: pembayaran menjadi refunded dan sisa Premium dari pembayaran ini dicabut'
             : 'refund sebagian: dicatat untuk ditinjau, masa aktif Premium tidak diubah';
         if (! $confirm) {

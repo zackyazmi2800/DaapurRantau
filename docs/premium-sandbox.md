@@ -90,7 +90,7 @@ Midtrans tidak dapat me-refund Virtual Account. Setelah dana ditransfer manual k
 php artisan payments:refund <id-pembayaran> --amount=5000 --reason="Permintaan pengguna" --reference=<referensi-transfer> --confirm
 ```
 
-Tanpa `--confirm` tidak ada yang dicatat. Referensi yang sama tidak dicatat dua kali, dan total refund tidak boleh melebihi nominal pembayaran. Jika totalnya sama dengan nominal pembayaran, aturan refund penuh berlaku; jika kurang, refund masuk peninjauan tanpa mengubah Premium. Refund atau chargeback yang notifikasinya tidak sampai tidak terdeteksi oleh rekonsiliasi, karena rekonsiliasi hanya memeriksa pembayaran `pending` dan `review`.
+Tanpa `--confirm` tidak ada yang dicatat. Referensi yang sama tidak dicatat dua kali, dan total refund tidak boleh melebihi nominal pembayaran. Total itu mencakup refund manual sebelumnya dan refund sebagian yang sudah tercatat dari Midtrans; karena Midtrans melaporkan jumlah kumulatif, yang dihitung adalah nilai terbesarnya. Perintah menolak kelebihan dan menyebut sisa yang masih dapat direfund. Jika totalnya sama dengan nominal pembayaran, aturan refund penuh berlaku; jika kurang, refund masuk peninjauan tanpa mengubah Premium. Refund atau chargeback yang notifikasinya tidak sampai tidak terdeteksi oleh rekonsiliasi, karena rekonsiliasi hanya memeriksa pembayaran `pending` dan `review`.
 
 ## Perhitungan kuota dan masa aktif
 
