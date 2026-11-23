@@ -16,6 +16,12 @@ class RequireCollectionAccount
                 : response()->view('account.required', [], 401);
         }
 
+        if (! app(\App\Services\SubscriptionService::class)->active($request->user()->id)) {
+            return $request->expectsJson()
+                ? response()->json(['message' => 'Favorit dan riwayat memerlukan Premium.', 'pricing_url' => route('pricing')], 403)
+                : response()->view('subscription.required', [], 403);
+        }
+
         return $next($request);
     }
 }

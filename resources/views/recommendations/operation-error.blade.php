@@ -6,7 +6,11 @@
         <h1 class="section-title">Pencarian belum dapat dilanjutkan</h1>
         <p role="alert" class="mt-5 leading-7 text-muted">{{ $message }}</p>
         <x-button href="{{ route('home') }}#cari-resep" class="mt-8">Kembali ke bahanmu</x-button>
+        @auth
+        <a href="{{ route('subscription.show') }}" class="nav-link ml-4 text-primary">Langganan saya</a>
+        @else
         <a href="{{ route('account.required') }}" class="nav-link ml-4 text-primary">Login / Daftar</a>
+        @endauth
     </div>
 </section>
 @endsection

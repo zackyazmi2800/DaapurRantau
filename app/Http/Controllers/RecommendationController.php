@@ -21,7 +21,7 @@ use Symfony\Component\HttpFoundation\Response;
 
 class RecommendationController extends Controller
 {
-    public function __construct(private SavedRecipeService $favorites, private RecommendationOperationService $operations) {}
+    public function __construct(private SavedRecipeService $favorites, private RecommendationOperationService $operations, private \App\Services\SubscriptionService $subscriptions) {}
 
     public function store(GenerateRecipeRequest $request, GeminiRecipeService $service, RecipeMatchingService $matching, RecommendationSnapshotService $snapshots): Response
     {
@@ -70,7 +70,7 @@ class RecommendationController extends Controller
             $message = $exception->getMessage();
 
             return $request->expectsJson()
-                ? response()->json(['message' => $message, 'account_url' => route('account.required')], $exception->status)
+                ? response()->json(['message' => $message, 'account_url' => route($request->user() ? 'pricing' : 'account.required')], $exception->status)
                 : response()->view('recommendations.operation-error', compact('message'), $exception->status);
         } catch (RecipeGenerationException $exception) {
             $request->merge($data);
@@ -98,7 +98,7 @@ class RecommendationController extends Controller
     {
         $snapshot = $snapshots->find($request->session(), $search);
 
-        if ($snapshot && $request->user()) {
+        if ($snapshot && $request->user() && $this->subscriptions->active($request->user()->id)) {
             $snapshot['recipes'] = $this->favorites->mark($request->user()->getAuthIdentifier(), $snapshot['recipes']);
         }
 
@@ -113,7 +113,7 @@ class RecommendationController extends Controller
         if (! $snapshot) {
             return response()->view('recommendations.expired', [], 410);
         }
-        if ($request->user()) {
+        if ($request->user() && $this->subscriptions->active($request->user()->id)) {
             $snapshot['recipes'] = $this->favorites->mark($request->user()->getAuthIdentifier(), $snapshot['recipes']);
         }
         $selected = collect($snapshot['recipes'])->firstWhere('id', $recipe);

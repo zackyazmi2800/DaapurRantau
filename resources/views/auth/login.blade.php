@@ -1,7 +1,7 @@
 @extends('auth.shell')
 @section('title', 'Masuk — Dapur Rantau')
 @section('heading', 'Selamat datang kembali')
-@section('intro', 'Masuk dengan akun terverifikasi untuk menyimpan favorit, riwayat, dan melanjutkan pencarian.')
+@section('intro', 'Masuk dengan akun terverifikasi untuk melanjutkan pencarian atau membeli paket Premium.')
 @section('form')
 <form action="{{ route('login.store') }}" method="POST" novalidate class="space-y-5">@csrf
     <x-auth-field name="email" label="Email" type="email" autocomplete="email" maxlength="255" />

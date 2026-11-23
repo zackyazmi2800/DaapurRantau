@@ -15,7 +15,7 @@ class RecommendationOperationService
 {
     private const LEASE_SECONDS = 600;
 
-    public function __construct(private SearchHistoryService $history) {}
+    public function __construct(private SearchHistoryService $history, private QuotaService $quota, private SubscriptionService $subscriptions) {}
 
     public function remaining(Request $request): int
     {
@@ -85,8 +85,10 @@ class RecommendationOperationService
                     ? 'Kuota tiga pencarian guest sudah habis. Login atau daftar diperlukan untuk melanjutkan.'
                     : 'Kuota sedang digunakan pencarian lain. Tunggu hingga pencarian selesai.', 429);
             }
+            $dailyUsageId = $user !== null ? $this->quota->reserve($user) : null;
             $operation ??= new RecommendationOperation;
             $operation->forceFill(['guest_quota_id' => $guest?->id, 'user_id' => $user, 'idempotency_key' => $key, 'input_hash' => $hash,
+                'daily_usage_id' => $dailyUsageId,
                 'status' => 'reserved', 'generation' => ($operation->generation ?? 0) + 1,
                 'lease_token' => bin2hex(random_bytes(32)), 'lease_expires_at' => now()->addSeconds(self::LEASE_SECONDS)])->save();
             if ($guest) {
@@ -116,7 +118,12 @@ class RecommendationOperationService
                 ]);
             } else {
                 // History and successful result commit together; never write guest history.
-                $this->history->recordUser($operation->user_id, $snapshot, $operation->id);
+                if ($operation->daily_usage_id) {
+                    $this->quota->complete($operation->daily_usage_id);
+                }
+                if ($this->subscriptions->active($operation->user_id)) {
+                    $this->history->recordUser($operation->user_id, $snapshot, $operation->id);
+                }
             }
         });
     }

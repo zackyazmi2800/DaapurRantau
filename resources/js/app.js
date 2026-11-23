@@ -63,3 +63,26 @@ document.addEventListener('click', (event) => {
 document.addEventListener('focusin', (event) => {
     if (profile && !profile.contains(event.target)) closeProfile();
 });
+
+const checkout = document.querySelector('[data-snap-checkout]');
+if (checkout) {
+    const button = checkout.querySelector('#open-snap');
+    const message = checkout.querySelector('#snap-message');
+    const openPayment = () => {
+        if (!window.snap) {
+            message.textContent = 'Pembayaran Sandbox belum termuat. Muat ulang halaman untuk mencoba kembali.';
+            return;
+        }
+        button.disabled = true;
+        const showStatus = () => window.location.assign(checkout.dataset.returnUrl);
+        window.snap.pay(checkout.dataset.token, {
+            onSuccess: showStatus,
+            onPending: showStatus,
+            onError: showStatus,
+            onClose: () => { button.disabled = false; },
+        });
+    };
+    button.addEventListener('click', openPayment);
+    if (document.readyState === 'complete') openPayment();
+    else window.addEventListener('load', () => { if (!button.disabled) openPayment(); }, { once: true });
+}

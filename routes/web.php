@@ -4,10 +4,18 @@ use App\Http\Controllers\FavoriteController;
 use App\Http\Controllers\HistoryController;
 use App\Http\Controllers\HomeController;
 use App\Http\Controllers\RecommendationController;
+use App\Http\Controllers\SubscriptionController;
 use App\Http\Middleware\LimitConcurrentRecipes;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', [HomeController::class, 'index'])->name('home');
+
+Route::get('/paket', [SubscriptionController::class, 'pricing'])->name('pricing');
+Route::middleware('auth')->group(function () {
+    Route::get('/langganan', [SubscriptionController::class, 'show'])->name('subscription.show');
+    Route::post('/langganan/checkout', [SubscriptionController::class, 'checkout'])->middleware('throttle:6,1')->name('subscription.checkout');
+    Route::post('/langganan/status', [SubscriptionController::class, 'sync'])->middleware('throttle:10,1,payment-status')->name('subscription.sync');
+});
 
 Route::get('/rekomendasi', fn () => redirect()->to(route('home').'#cari-resep'));
 
