@@ -266,7 +266,7 @@ class MidtransSandboxService
     {
         $adjustment = $this->adjustment($payment, $current);
         if ($adjustment === null) {
-            return in_array($payment->status, ['paid', 'chargeback'], true) ? null : $this->apply($payment, $this->paymentStatus($current));
+            return in_array($payment->status, ['paid', 'chargeback'], true) ? null : $this->apply($payment, $this->paymentStatus($current), $current);
         }
         $outcome = $adjustment[0] === 'partial_refund'
             ? $this->adjustments->recordMidtransPartialRefund($payment, $current)
@@ -319,13 +319,13 @@ class MidtransSandboxService
         return $current;
     }
 
-    private function apply(object $payment, string $status): ?string
+    private function apply(object $payment, string $status, array $current): ?string
     {
         if ($status === 'paid' && ! $this->subscriptions->supports((int) $payment->plan_id)) {
             $status = 'review';
         }
         $review = null;
-        $changed = DB::transaction(function () use ($payment, $status, &$review) {
+        $changed = DB::transaction(function () use ($payment, $status, $current, &$review) {
             $review = null;
             $query = DB::table('payments')->where('id', $payment->id)->whereNotIn('status', ['paid', 'refunded', 'chargeback']);
             if ($status === 'paid') {
@@ -344,7 +344,7 @@ class MidtransSandboxService
             }
             if (! $changed && $status === 'paid'
                 && ! in_array(DB::table('payments')->where('id', $payment->id)->value('status'), ['paid', 'refunded', 'chargeback'], true)) {
-                $review = $this->adjustments->record($payment, 'settlement', 'midtrans', null, 'settlement');
+                $review = $this->adjustments->record($payment, 'settlement', 'midtrans', null, $this->settlementReference($payment, $current));
             }
 
             return $changed;
@@ -354,6 +354,17 @@ class MidtransSandboxService
         }
 
         return $changed ? $status : ($review === 'unchanged' ? null : $review);
+    }
+
+    private function settlementReference(object $payment, array $current): string
+    {
+        $transaction = $current['transaction_id'] ?? null;
+        if (! is_string($transaction) || trim($transaction) === '' || strlen($transaction) > 100
+            || DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => 'settlement'])->exists()) {
+            return 'settlement';
+        }
+
+        return 'settlement:'.hash('sha256', $transaction);
     }
 
     private function paymentStatus(array $data): string

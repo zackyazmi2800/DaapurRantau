@@ -1165,6 +1165,82 @@ class PaymentReversalTest extends TestCase
         $this->assertLogsAreSafe(['payment.adjustment', 'payment.review_closed']);
     }
 
+    public function test_a_new_settlement_transaction_after_a_closed_review_opens_one_new_review(): void
+    {
+        $review = fn (object $payment, array $options) => $this->artisan('payments:review', $options + ['payment' => $payment->id]);
+        $user = User::factory()->create();
+        [$a, $b, $legacy] = [$this->pay($user), $this->pay($user), $this->pay($user)];
+        $outsider = User::factory()->create();
+        $foreign = $this->pay($outsider);
+        $this->travel(2)->days();
+        $rows = fn (object $payment) => DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->get()
+            ->map(fn ($row) => [$row->kind, $row->reference, $row->status])->all();
+        $closed = fn () => collect($this->logged)->where('message', 'payment.review_closed')->count();
+        $adjusted = fn () => collect($this->logged)->where('message', 'payment.adjustment')->count();
+        $kept = [$this->state($foreign), $this->period($foreign), $this->ends($outsider)];
+        $deny = ['reversal', 'reversal:deny', 'resolved'];
+        foreach ([$a, $legacy] as $payment) {
+            $this->midtrans($payment, 'deny', ['status_code' => '202', 'transaction_id' => 'T1'])->assertOk();
+            $review($payment, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1')->assertSuccessful();
+        }
+        $revoked = $this->period($a);
+        $this->assertSame(['failed', 'revoked'], [$this->state($a), $revoked[0]]);
+        $ends = $this->ends($user);
+
+        $this->midtrans($a, 'settlement', ['status_code' => '200', 'transaction_id' => 'T2'])->assertOk();
+        $this->assertSame([$deny, ['settlement', 'settlement:'.hash('sha256', 'T2'), 'pending_review']], $rows($a));
+        $this->assertSame(['failed', $revoked, $ends], [$this->state($a), $this->period($a), $this->ends($user)]);
+        $open = $this->snapshot();
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->assertSame('failed', app(MidtransSandboxService::class)->sync($user->id, $a->order_id));
+        $this->assertSame([], app(MidtransSandboxService::class)->reconcile($a->order_id));
+        $this->assertSame($open, $this->snapshot());
+
+        $review($a, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1')->assertSuccessful();
+        $review($a, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada peninjauan terbuka')->assertSuccessful();
+        $this->assertSame([$deny, ['settlement', 'settlement:'.hash('sha256', 'T2'), 'rejected']], $rows($a));
+        $done = $this->snapshot();
+        $logs = [$adjusted(), $closed()];
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->assertSame('failed', app(MidtransSandboxService::class)->sync($user->id, $a->order_id));
+        $this->gateway[$a->order_id]['transaction_id'] = 'T3';
+        try {
+            DB::transaction(function () use ($user, $a) {
+                $this->assertSame('failed', app(MidtransSandboxService::class)->sync($user->id, $a->order_id));
+                throw new DomainException('batal');
+            });
+            $this->fail('Transaksi luar seharusnya batal.');
+        } catch (DomainException) {
+        }
+        $this->assertSame($done, $this->snapshot());
+        $this->assertSame($logs, [$adjusted(), $closed()]);
+
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->notice($a->order_id, 'settlement')->assertOk();
+        $this->assertSame([$deny, ['settlement', 'settlement:'.hash('sha256', 'T2'), 'rejected'], ['settlement', 'settlement:'.hash('sha256', 'T3'), 'pending_review']], $rows($a));
+        $this->assertSame(['failed', $revoked, $ends], [$this->state($a), $this->period($a), $this->ends($user)]);
+        $this->assertSame($logs[0] + 1, $adjusted());
+        $review($a, ['--restore' => true])->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        $this->assertSame('failed', $this->state($a));
+        $review($a, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1 peninjauan; Premium dari pembayaran ini dipulihkan')->assertSuccessful();
+        $review($a, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada peninjauan terbuka')->assertSuccessful();
+        $this->assertSame(['paid', 'active'], [$this->state($a), $this->period($a)[0]]);
+        $restored = $this->snapshot();
+        $this->midtrans($a, 'settlement', ['status_code' => '200', 'transaction_id' => 'T4'])->assertOk();
+        $this->assertSame($restored, $this->snapshot());
+
+        $this->midtrans($legacy, 'settlement', ['status_code' => '200', 'transaction_id' => null])->assertOk();
+        $review($legacy, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1')->assertSuccessful();
+        $this->midtrans($legacy, 'settlement', ['status_code' => '200', 'transaction_id' => 'T5'])->assertOk();
+        $this->assertSame([$deny, ['settlement', 'settlement', 'rejected']], $rows($legacy));
+        $this->assertSame('failed', $this->state($legacy));
+
+        $this->assertSame([], $rows($b));
+        $this->assertSame($kept, [$this->state($foreign), $this->period($foreign), $this->ends($outsider)]);
+        $this->assertConsistent();
+        $this->assertLogsAreSafe(['payment.adjustment', 'payment.review_closed']);
+    }
+
     public function test_reviews_without_a_usable_period_are_refused_and_stay_open(): void
     {
         $review = fn (object $payment, array $options) => $this->artisan('payments:review', $options + ['payment' => $payment->id]);
