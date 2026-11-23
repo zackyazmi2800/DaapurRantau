@@ -88,22 +88,26 @@ class MidtransSandboxService
         abort_unless($this->matchesAmount($notice['gross_amount'], $payment->amount), 422);
         $settled = in_array($payment->status, ['paid', 'chargeback'], true);
         $reversing = in_array($notice['transaction_status'], ['refund', 'partial_refund', 'chargeback', 'partial_chargeback', 'deny', 'cancel', 'expire', 'failure'], true);
-        if ($payment->status === 'refunded' || ($settled && ! $reversing)) {
+        $refunded = $payment->status === 'refunded';
+        if (($refunded && $notice['transaction_status'] !== 'partial_refund') || ($settled && ! $reversing)) {
             return;
         }
 
         // Status and fraud flags are outside the notification signature.
         $current = $this->currentStatus($payment);
         abort_if($current === null, 503, 'Status pembayaran belum dapat diverifikasi.');
+        if ($refunded && ($current['transaction_status'] ?? null) !== 'partial_refund') {
+            return;
+        }
 
         // A delayed notification may differ from the current gateway state.
-        if (! $settled && $this->adjustment($payment, $current) === null && $this->paymentStatus($current) === 'paid' && $this->paymentStatus($notice) !== 'paid') {
+        if (! $refunded && ! $settled && $this->adjustment($payment, $current) === null && $this->paymentStatus($current) === 'paid' && $this->paymentStatus($notice) !== 'paid') {
             // A stale or challenged notice cannot grant access.
             return;
         }
 
         try {
-            $this->settle($payment, $current);
+            $refunded ? $this->adjustments->recordMidtransPartialRefund($payment, $current) : $this->settle($payment, $current);
         } catch (Throwable $exception) {
             if ($exception instanceof HttpException || SqliteContention::isBusy($exception)) {
                 throw $exception;
@@ -261,7 +265,9 @@ class MidtransSandboxService
         if ($adjustment === null) {
             return in_array($payment->status, ['paid', 'chargeback'], true) ? null : $this->apply($payment, $this->paymentStatus($current));
         }
-        $outcome = $this->adjustments->record($payment, ...$adjustment);
+        $outcome = $adjustment[0] === 'partial_refund'
+            ? $this->adjustments->recordMidtransPartialRefund($payment, $current)
+            : $this->adjustments->record($payment, ...$adjustment);
 
         return $outcome === 'unchanged' ? null : $outcome;
     }
@@ -281,16 +287,9 @@ class MidtransSandboxService
         }
         $amount = $kind === 'refund' ? (int) $payment->amount : null;
         $reason = null;
-        if ($kind === 'partial_refund') {
-            $refunded = $current['refund_amount'] ?? null;
-            abort_unless(is_numeric($refunded) && (float) $refunded > 0 && (float) $refunded < $payment->amount, 422);
-            $amount = (int) round((float) $refunded);
-            $last = collect($current['refunds'] ?? [])->last();
-            $reason = is_array($last) && is_string($last['reason'] ?? null) && $last['reason'] !== '' ? mb_substr($last['reason'], 0, 255) : null;
-        }
 
         return [$kind, 'midtrans', $amount, match ($kind) {
-            'partial_refund' => "partial_refund:{$amount}",
+            'partial_refund' => 'partial_refund:cumulative',
             'reversal' => "reversal:{$status}",
             default => $kind,
         }, $reason];

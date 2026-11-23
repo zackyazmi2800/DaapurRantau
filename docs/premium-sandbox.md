@@ -170,3 +170,20 @@ php artisan migrate:rollback --step=1 --path=database/migrations/2026_11_21_0000
 - `tests/Feature/PremiumSubscriptionTest.php` (baru)
 
 Migration juga memperbarui skema SQLite development lokal di `database/database.sqlite`. Vite menghasilkan aset lokal di `public/build/`. Keduanya berada di luar Git.
+
+
+## A3 — refund sebagian Midtrans
+
+Detail status gateway memakai `refunds[].refund_key` sebagai identitas dan `refunds[].refund_amount` sebagai nominal individual. Referensi tersimpan memakai hash SHA-256 dari key lengkap. Pengulangan dan pembaruan metadata bank memakai baris yang sama. Konflik nominal untuk key sama ditolak 422 dan seluruh batch dibatalkan.
+
+Jika detail tidak disertakan atau berupa daftar kosong, `refund_amount` tingkat transaksi disimpan pada satu referensi `partial_refund:cumulative`. Nilai hanya naik. Detail lengkap yang berbeda totalnya dari snapshot, pecahan rupiah, nilai negatif, dan nominal yang tidak dapat ditafsirkan ditolak. Tanpa snapshot, hanya replay key yang sudah tersimpan dengan nominal identik yang diterima. Key baru atau konflik ditolak. Detail malformed ditolak meskipun snapshot valid tersedia.
+
+Batas refund manual A5 memakai nilai terbesar antara jumlah detail individual dan maksimum snapshot kumulatif (termasuk referensi legacy `partial_refund:{amount}`), kemudian menambahkan refund manual. Snapshot dan detail tidak dijumlahkan bersama. Snapshot fallback bergantung pada total kumulatif gateway yang valid. Payload ambigu memerlukan pemeriksaan operator dan tidak dikoreksi otomatis.
+
+Total refund lintas sumber adalah jumlah refund manual ditambah total Midtrans di atas, dan dipakai oleh perintah manual maupun webhook. Refund manual yang melebihi sisa ditolak. Webhook Midtrans yang valid tetap dicatat dengan nominal sebenarnya karena dana sudah dikembalikan gateway. Jika total lintas sumber mencapai nominal pembayaran, aturan refund penuh berlaku satu kali: pembayaran menjadi `refunded`, sisa Premium dicabut, dan peninjauan lain ditutup. Jika total melebihi nominal, baris Midtrans yang memicunya tetap `pending_review` dengan alasan diawali "Kelebihan refund Rp…" dan log `payment.refund_excess`; tutup dengan `payments:review <id> --revoke --confirm` setelah diperiksa. Referensi manual yang sama dengan `refund_key` Midtrans pada pembayaran yang sama ditolak. Jika `refund_key` Midtrans sama dengan referensi manual yang sudah ada, refund tetap dicatat dan dihitung, lalu ditandai "Referensi sama dengan refund manual" serta log `payment.refund_reference_conflict`. Selama baris Midtrans tersebut masih `pending_review`, konflik dianggap terbuka: refund penuh otomatis ditunda (alasan "Refund penuh ditunda…"), periode Premium tidak diubah, dan refund manual baru ditolak. Operator menyelesaikannya dengan `payments:review <id> --restore|--revoke --confirm`; keputusan `--revoke` mencabut sisa Premium tetapi status pembayaran tetap `paid`.
+
+Webhook `partial_refund` untuk pembayaran yang sudah `refunded` tetap memeriksa status Midtrans. Refund baru dicatat satu kali sebagai `pending_review` dengan alasan "Refund setelah refund penuh terdeteksi…" dan log `payment.refund_after_full_refund`. Status `refunded`, `subscriptions`, dan `subscription_periods` tidak diubah. Nominalnya ikut dalam total refund; snapshot kumulatif tanpa detail hanya dicatat jika melebihi total Midtrans yang sudah tersimpan. Notifikasi lain untuk pembayaran `refunded` tetap diabaikan.
+
+Struktur field mengikuti [Get Transaction Status Midtrans](https://docs.midtrans.com/reference/get-transaction-status).
+
+Sinkronisasi payment paid dan rekonsiliasi refund merupakan pekerjaan terpisah. A3 mempertahankan refresh() dan pemilihan payment existing, sehingga pembayaran paid masih bergantung pada webhook untuk deteksi refund.

@@ -23,16 +23,15 @@ class PaymentAdjustmentService
             $status = $kind === 'refund' && ! $untracked ? 'resolved' : 'pending_review';
             $now = now();
             if ($kind === 'refund') {
-                DB::table('payment_adjustments')->where('payment_id', $payment->id)->where('status', 'pending_review')
-                    ->update(['status' => 'resolved', 'updated_at' => $now]);
+                $this->refundInFull($payment->id, $now);
             }
             DB::table('payment_adjustments')->insert($key + ['kind' => $kind, 'status' => $status, 'amount' => $amount,
                 'reason' => $reason, 'created_at' => $now, 'updated_at' => $now]);
-            if (in_array($kind, ['refund', 'chargeback'], true)) {
-                DB::table('payments')->where('id', $payment->id)->update(['status' => $kind === 'refund' ? 'refunded' : 'chargeback', 'updated_at' => $now]);
+            if ($kind === 'chargeback') {
+                DB::table('payments')->where('id', $payment->id)->update(['status' => 'chargeback', 'updated_at' => $now]);
             }
-            if (! in_array($kind, ['partial_refund', 'settlement'], true)) {
-                $this->subscriptions->withdraw($payment->id, $kind === 'refund' ? 'revoked' : 'suspended');
+            if (! in_array($kind, ['partial_refund', 'settlement', 'refund'], true)) {
+                $this->subscriptions->withdraw($payment->id, 'suspended');
             }
 
             return [match ($kind) {
@@ -46,6 +45,201 @@ class PaymentAdjustmentService
         }
 
         return $outcome;
+    }
+
+    private function refundInFull(int $paymentId, mixed $now): void
+    {
+        DB::table('payment_adjustments')->where('payment_id', $paymentId)->where('status', 'pending_review')
+            ->update(['status' => 'resolved', 'updated_at' => $now]);
+        DB::table('payments')->where('id', $paymentId)->update(['status' => 'refunded', 'updated_at' => $now]);
+        $this->subscriptions->withdraw($paymentId, 'revoked');
+    }
+
+    private function refundRupiah(mixed $value, int $limit): ?int
+    {
+        if ((! is_string($value) && ! is_int($value))
+            || ! preg_match('/\A[0-9]{1,9}(?:\.00)?\z/', (string) $value)) {
+            return null;
+        }
+        $amount = (int) $value;
+
+        return $amount > 0 && $amount < $limit ? $amount : null;
+    }
+
+    public function recordMidtransPartialRefund(object $payment, array $payload): string
+    {
+        $total = $this->refundRupiah($payload['refund_amount'] ?? null, (int) $payment->amount);
+        $details = [];
+        $refunds = array_key_exists('refunds', $payload) ? $payload['refunds'] : [];
+        abort_unless(is_array($refunds) && array_is_list($refunds), 422);
+        $usable = $refunds !== [];
+        foreach ($refunds as $refund) {
+            $key = is_array($refund) ? ($refund['refund_key'] ?? null) : null;
+            $amount = is_array($refund) ? $this->refundRupiah($refund['refund_amount'] ?? null, (int) $payment->amount) : null;
+            abort_unless(is_string($key) && trim($key) !== '' && $amount !== null, 422);
+            // Hash the exact provider key to keep references bounded and private.
+            $reference = 'partial_refund:key:'.hash('sha256', $key);
+            abort_if(isset($details[$reference]) && $details[$reference]['amount'] !== $amount, 422);
+            $details[$reference] = ['key' => $key, 'amount' => $amount, 'reason' => is_string($refund['reason'] ?? null)
+                ? mb_substr($refund['reason'], 0, 255) : null];
+        }
+        if ($usable) {
+            $sum = array_sum(array_column($details, 'amount'));
+            abort_if($sum >= $payment->amount, 422);
+            if (array_key_exists('refund_amount', $payload)) {
+                abort_unless($total !== null && $sum === $total, 422);
+            }
+        } else {
+            abort_unless($total !== null, 422);
+            $details = ['partial_refund:cumulative' => ['amount' => $total, 'reason' => null]];
+        }
+
+        return DB::transaction(function () use ($payment, $details, $total) {
+            DB::table('users')->where('id', $payment->user_id)->update(['id' => DB::raw('id')]);
+            $current = DB::table('payments')->where('id', $payment->id)->value('status');
+            $after = $current === 'refunded';
+            $changed = [];
+            foreach ($details as $reference => $detail) {
+                if ($after && $reference === 'partial_refund:cumulative' && $detail['amount'] <= $this->midtransRefundTotal($payment->id)) {
+                    continue;
+                }
+                $query = DB::table('payment_adjustments')->where([
+                    'payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => $reference,
+                ]);
+                $existing = (clone $query)->first();
+                if ($existing) {
+                    if ($reference === 'partial_refund:cumulative') {
+                        if ($detail['amount'] > $existing->amount) {
+                            $query->update(['amount' => $detail['amount'], 'status' => 'pending_review', 'updated_at' => now()]);
+                            $changed[] = $reference;
+                        }
+                    } else {
+                        abort_unless((int) $existing->amount === $detail['amount'], 422);
+                    }
+
+                    continue;
+                }
+                // Without a cumulative total, only identical stored keys may replay.
+                abort_if($total === null, 422);
+                if ($after) {
+                    DB::table('payment_adjustments')->insert(['payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => $reference,
+                        'kind' => 'partial_refund', 'status' => 'pending_review', 'amount' => $detail['amount'], 'reason' => $detail['reason'],
+                        'created_at' => now(), 'updated_at' => now()]);
+                    $changed[] = $reference;
+                } elseif ($this->record($payment, 'partial_refund', 'midtrans', $detail['amount'], $reference, $detail['reason']) !== 'unchanged') {
+                    $changed[] = $reference;
+                }
+            }
+            $refunded = $this->refundTotal($payment->id);
+            abort_if($refunded['midtrans'] >= $payment->amount, 422);
+
+            return match (true) {
+                $changed === [] => 'unchanged',
+                $after => $this->flagRefundAfterFullRefund($payment, $changed),
+                default => $this->settleRefundTotal($payment, $current, $refunded['total'], $changed, $details),
+            };
+        }, 3);
+    }
+
+    private function settleRefundTotal(object $payment, string $current, int $total, array $changed, array $details): string
+    {
+        $now = now();
+        $notes = [];
+        foreach ($changed as $reference) {
+            $key = $details[$reference]['key'] ?? null;
+            if ($key !== null && DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'manual', 'reference' => $key])->exists()) {
+                $notes[$reference][] = 'Referensi sama dengan refund manual; periksa kemungkinan tercatat ganda.';
+            }
+        }
+        $blocked = $this->referenceConflictOpen($payment->id);
+        $reached = $total >= $payment->amount && in_array($current, ['paid', 'chargeback'], true);
+        $full = $reached && ! $blocked;
+        $deferred = $reached && $blocked;
+        $conflict = $notes !== [] || $deferred;
+        $excess = $full ? $total - (int) $payment->amount : 0;
+        $tracked = DB::table('subscription_periods')->where('payment_id', $payment->id)->exists();
+        foreach ($deferred ? $changed : [] as $reference) {
+            $notes[$reference][] = 'Refund penuh ditunda: konflik referensi manual dan Midtrans belum ditinjau.';
+        }
+        if ($full) {
+            $this->refundInFull($payment->id, $now);
+            $rupiah = fn (int $value) => 'Rp'.number_format($value, 0, ',', '.');
+            $note = $excess > 0 ? "Kelebihan refund {$rupiah($excess)}: total manual dan Midtrans {$rupiah($total)} melebihi pembayaran {$rupiah((int) $payment->amount)}." : null;
+            foreach ($excess > 0 || ! $tracked ? $changed : [] as $reference) {
+                $notes[$reference][] = $note;
+            }
+        }
+        foreach ($notes as $reference => $lines) {
+            $query = DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => $reference]);
+            $reason = (clone $query)->value('reason');
+            $query->update(['status' => 'pending_review', 'updated_at' => $now,
+                'reason' => mb_substr(implode(' ', array_filter([...$lines, $reason])), 0, 255) ?: null]);
+        }
+        DB::afterCommit(function () use ($payment, $full, $excess, $conflict, $tracked) {
+            $context = ['payment_id' => $payment->id, 'source' => 'midtrans'];
+            if ($full) {
+                Log::warning('payment.adjustment', $context + ['kind' => 'refund', 'status' => $excess > 0 || ! $tracked ? 'pending_review' : 'resolved']);
+            }
+            if ($excess > 0) {
+                Log::warning('payment.refund_excess', $context + ['status' => 'pending_review']);
+            }
+            if ($conflict) {
+                Log::warning('payment.refund_reference_conflict', $context + ['status' => 'pending_review']);
+            }
+        });
+
+        return $full ? 'refunded' : 'disputed';
+    }
+
+    private function flagRefundAfterFullRefund(object $payment, array $changed): string
+    {
+        $note = 'Refund setelah refund penuh terdeteksi; periksa kemungkinan kelebihan refund.';
+        foreach ($changed as $reference) {
+            $query = DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => $reference]);
+            $reason = (string) (clone $query)->value('reason');
+            $query->update(['status' => 'pending_review', 'updated_at' => now(),
+                'reason' => str_starts_with($reason, $note) ? $reason : mb_substr(trim("$note $reason"), 0, 255)]);
+        }
+        DB::afterCommit(fn () => Log::warning('payment.refund_after_full_refund', ['payment_id' => $payment->id, 'source' => 'midtrans', 'status' => 'pending_review']));
+
+        return 'disputed';
+    }
+
+    private function referenceConflictOpen(int $paymentId): bool
+    {
+        $references = DB::table('payment_adjustments')->where(['payment_id' => $paymentId, 'source' => 'manual'])->pluck('reference')
+            ->map(fn ($reference) => 'partial_refund:key:'.hash('sha256', $reference))->all();
+
+        return $references !== [] && DB::table('payment_adjustments')
+            ->where(['payment_id' => $paymentId, 'source' => 'midtrans', 'status' => 'pending_review'])->whereIn('reference', $references)->exists();
+    }
+
+    private function refundTotal(int $paymentId): array
+    {
+        $manual = (int) DB::table('payment_adjustments')->where(['payment_id' => $paymentId, 'source' => 'manual'])->sum('amount');
+        $midtrans = $this->midtransRefundTotal($paymentId);
+
+        return ['manual' => $manual, 'midtrans' => $midtrans, 'total' => $manual + $midtrans];
+    }
+
+    private function midtransRefundTotal(int $paymentId): int
+    {
+        $rows = DB::table('payment_adjustments')->where([
+            'payment_id' => $paymentId, 'source' => 'midtrans', 'kind' => 'partial_refund',
+        ])->get(['reference', 'amount']);
+        $individual = 0;
+        $cumulative = 0;
+        foreach ($rows as $row) {
+            if (str_starts_with($row->reference, 'partial_refund:key:')) {
+                $individual += (int) $row->amount;
+            } else {
+                // Legacy amount-based references and the stable fallback are snapshots
+                // of the same gateway total, including any overlapping individual rows.
+                $cumulative = max($cumulative, (int) $row->amount);
+            }
+        }
+
+        return max($individual, $cumulative);
     }
 
     public function close(object $payment, bool $restore, bool $confirm): array
@@ -141,11 +335,17 @@ class PaymentAdjustmentService
                 ? [true, 'Referensi ini sudah dicatat untuk pembayaran tersebut. Tidak ada perubahan.']
                 : [false, 'Referensi ini sudah dicatat dengan nominal berbeda.'];
         }
+        if (DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans',
+            'reference' => 'partial_refund:key:'.hash('sha256', $reference)])->exists()) {
+            return [false, 'Referensi ini sudah tercatat sebagai refund Midtrans untuk pembayaran ini. Tidak ada yang dicatat.'];
+        }
+        if ($this->referenceConflictOpen($payment->id)) {
+            return [false, 'Ada konflik referensi refund manual dan Midtrans yang belum ditinjau. Selesaikan dengan payments:review sebelum mencatat refund manual baru. Tidak ada yang dicatat.'];
+        }
         if ($payment->status !== 'paid') {
             return [false, 'Hanya pembayaran berstatus paid yang dapat dicatat refund manualnya.'];
         }
-        $gateway = (int) DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'kind' => 'partial_refund'])->max('amount');
-        $left = (int) $payment->amount - (int) $manual->sum('amount') - $gateway;
+        $left = (int) $payment->amount - $this->refundTotal($payment->id)['total'];
         if ($amount > $left) {
             return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.').'.'];
         }
