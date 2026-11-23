@@ -876,7 +876,7 @@ class PaymentReversalTest extends TestCase
         $this->midtrans($pending, 'partial_refund', ['refund_amount' => '5000.00', 'refunds' => []])->assertUnprocessable();
         $this->artisan('payments:refund', ['payment' => $pending->id, '--amount' => '1000', '--reason' => 'uji', '--reference' => 'TRF-1', '--confirm' => true])
             ->expectsOutputToContain('paid')->assertFailed();
-        $this->artisan('payments:review', ['payment' => $pending->id, '--revoke' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada periode Premium')->assertFailed();
+        $this->artisan('payments:review', ['payment' => $pending->id, '--restore' => true, '--confirm' => true])->expectsOutputToContain('belum pernah mengaktifkan Premium')->assertFailed();
         $this->assertSame($once, $this->snapshot());
         $this->assertSame(['unchanged' => 1], app(MidtransSandboxService::class)->reconcile($pending->order_id));
         $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"]], $rows($pending));
@@ -908,6 +908,130 @@ class PaymentReversalTest extends TestCase
         $this->assertSame(4, collect($this->logged)->where('message', 'payment.refund_on_pending')->count());
         $this->assertConsistent();
         $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_on_pending', 'payment.reconcile_unverified']);
+    }
+
+    public function test_pending_refund_review_without_a_period_can_only_be_revoked(): void
+    {
+        $review = fn (object $payment, array $options) => $this->artisan('payments:review', $options + ['payment' => $payment->id]);
+        $user = User::factory()->create();
+        $paid = $this->pay($user);
+        [$pending, $settled] = [$this->order($user), $this->order($user)];
+        $tracked = $this->pay(User::factory()->create());
+        DB::table('payment_adjustments')->insert(['payment_id' => $settled->id, 'kind' => 'settlement', 'source' => 'midtrans', 'reference' => 'settlement', 'status' => 'pending_review']);
+        $this->travel(1)->days();
+        $note = 'Refund sebagian pada pembayaran pending terdeteksi; Premium tidak diaktifkan sampai ditinjau.';
+        $first = ['refund_key' => 'k1', 'refund_amount' => '2000.00'];
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+        $this->midtrans($tracked, 'partial_refund', ['refund_amount' => '1000.00', 'refunds' => [['refund_key' => 'k9', 'refund_amount' => '1000.00']]])->assertOk();
+        $statuses = fn (object $payment) => DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->pluck('status')->all();
+        $premium = fn () => json_encode([DB::table('subscriptions')->orderBy('user_id')->get(), DB::table('subscription_periods')->orderBy('id')->get(),
+            DB::table('payments')->orderBy('id')->pluck('status')->all()]);
+        $kept = $premium();
+        $ends = $this->ends($user);
+        $closed = fn () => collect($this->logged)->where('message', 'payment.review_closed')->count();
+
+        $open = $this->snapshot();
+        $review($pending, ['--restore' => true])->expectsOutputToContain('belum pernah mengaktifkan Premium')->assertFailed();
+        $review($pending, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('belum pernah mengaktifkan Premium')->assertFailed();
+        $review($pending, ['--revoke' => true])->expectsOutputToContain('DRY-RUN, belum ada perubahan. Rencana: menutup 1 peninjauan; pembayaran tetap pending tanpa periode Premium')->assertSuccessful();
+        try {
+            DB::transaction(function () use ($pending) {
+                $this->assertTrue(app(PaymentAdjustmentService::class)->close($pending, false, true)[0]);
+                throw new DomainException('batal');
+            });
+            $this->fail('Transaksi luar seharusnya batal.');
+        } catch (DomainException) {
+        }
+        $this->assertSame($open, $this->snapshot());
+        $this->assertSame(0, $closed());
+
+        $review($pending, ['--revoke' => true, '--confirm' => true])
+            ->expectsOutputToContain('Ditutup: 1 peninjauan; pembayaran tetap pending tanpa periode Premium. Premium tidak diaktifkan.')->assertSuccessful();
+        $this->assertSame(['resolved'], $statuses($pending));
+        $this->assertSame(['pending', null, $ends], [$this->state($pending), $this->period($pending), $this->ends($user)]);
+        $this->assertSame($kept, $premium());
+        $this->assertSame(1, $closed());
+
+        $done = $this->snapshot();
+        $review($pending, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada peninjauan terbuka')->assertSuccessful();
+        $review($pending, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada peninjauan terbuka')->assertSuccessful();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+        $this->notice($pending->order_id, 'settlement')->assertOk();
+        $this->assertSame($done, $this->snapshot());
+        $this->assertSame(1, $closed());
+
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [$first, ['refund_key' => 'k2', 'refund_amount' => '1500.00']]])->assertOk();
+        $this->assertSame(['resolved', 'pending_review'], $statuses($pending));
+        $this->assertSame($note, DB::table('payment_adjustments')->where('payment_id', $pending->id)->orderByDesc('id')->value('reason'));
+        $review($pending, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('belum pernah mengaktifkan Premium')->assertFailed();
+        $review($pending, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1 peninjauan')->assertSuccessful();
+        $this->assertSame(['resolved', 'resolved'], $statuses($pending));
+        $this->assertSame(2, $closed());
+
+        $review($settled, ['--revoke' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada periode Premium yang tercatat')->assertFailed();
+        $review($settled, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada periode Premium yang tercatat')->assertFailed();
+        $this->assertSame(['pending_review'], $statuses($settled));
+        $review($tracked, ['--revoke' => true])->expectsOutputToContain('sisa Premium dari pembayaran ini dicabut')->assertSuccessful();
+        $review($tracked, ['--restore' => true, '--confirm' => true])->expectsOutputToContain('Premium dari pembayaran ini dipertahankan')->assertSuccessful();
+        $this->assertSame(['rejected'], $statuses($tracked));
+        $this->assertSame(['active', 'pending', 'pending'], [$this->period($tracked)[0], $this->state($pending), $this->state($settled)]);
+        $this->assertSame($kept, $premium());
+        $this->assertSame([], DB::table('payment_adjustments')->where('payment_id', $paid->id)->pluck('id')->all());
+        $this->assertConsistent();
+        $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_on_pending', 'payment.review_closed']);
+    }
+
+    public function test_cumulative_snapshot_replays_do_not_reopen_closed_refund_reviews(): void
+    {
+        $owner = User::factory()->create();
+        $pending = $this->order($owner);
+        $buyer = User::factory()->create();
+        $paid = $this->pay($buyer);
+        $outsider = User::factory()->create();
+        $foreign = $this->pay($outsider);
+        $this->travel(1)->days();
+        $kept = [$this->state($foreign), $this->period($foreign), $this->ends($outsider)];
+        $refundLogs = fn () => collect($this->logged)->whereIn('message', ['payment.adjustment', 'payment.refund_on_pending'])->count();
+        $first = ['refund_key' => 'k1', 'refund_amount' => '2000.00'];
+        $second = ['refund_key' => 'k2', 'refund_amount' => '1500.00'];
+
+        foreach ([[$pending, '--revoke'], [$paid, '--restore']] as [$payment, $decision]) {
+            $premium = [$this->state($payment), $this->period($payment), $this->ends($payment === $paid ? $buyer : $owner)];
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+            $this->artisan('payments:review', ['payment' => $payment->id, $decision => true, '--confirm' => true])->expectsOutputToContain('Ditutup: 1 peninjauan')->assertSuccessful();
+            $closed = $this->snapshot();
+            $logs = $refundLogs();
+
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => []])->assertOk();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '1500.00', 'refunds' => []])->assertOk();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '2500.00', 'refunds' => [array_replace($first, ['refund_amount' => '2500.00'])]])->assertUnprocessable();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '4000.00', 'refunds' => [$second, array_replace($first, ['refund_amount' => '2500.00'])]])->assertUnprocessable();
+            $this->assertSame($closed, $this->snapshot());
+            $this->assertSame($logs, $refundLogs());
+
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+            $this->assertSame([['partial_refund:key:'.hash('sha256', 'k1'), 2000, $decision === '--revoke' ? 'resolved' : 'rejected'], ['partial_refund:cumulative', 3500, 'pending_review']],
+                DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->get()->map(fn ($row) => [$row->reference, $row->amount, $row->status])->all());
+            $this->assertGreaterThan($logs, $refundLogs());
+            $raised = $this->snapshot();
+            $logs = $refundLogs();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3000.00', 'refunds' => []])->assertOk();
+            $this->assertSame($raised, $this->snapshot());
+            $this->assertSame($logs, $refundLogs());
+
+            $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [$first, $second]])->assertOk();
+            $this->assertSame(3, DB::table('payment_adjustments')->where('payment_id', $payment->id)->count());
+            $this->assertSame($premium, [$this->state($payment), $this->period($payment), $this->ends($payment === $paid ? $buyer : $owner)]);
+        }
+        $this->artisan('payments:refund', ['payment' => $paid->id, '--amount' => '1501', '--reason' => 'uji', '--reference' => 'TRF-1', '--confirm' => true])
+            ->expectsOutputToContain('Sisa yang dapat direfund: Rp1.500')->assertFailed();
+        $this->assertNull($this->period($pending));
+        $this->assertSame($kept, [$this->state($foreign), $this->period($foreign), $this->ends($outsider)]);
+        $this->assertSame(0, DB::table('payment_adjustments')->where('payment_id', $foreign->id)->count());
+        $this->assertConsistent();
+        $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_on_pending', 'payment.review_closed']);
     }
 
     public function test_interleaved_webhook_refresh_and_reconcile_record_a_pending_refund_once(): void

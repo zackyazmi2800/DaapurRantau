@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -100,7 +101,7 @@ class PaymentAdjustmentService
             $after = $current === 'refunded';
             $changed = [];
             foreach ($details as $reference => $detail) {
-                if ($after && $reference === 'partial_refund:cumulative' && $detail['amount'] <= $this->midtransRefundTotal($payment->id)) {
+                if ($reference === 'partial_refund:cumulative' && $detail['amount'] <= $this->midtransRefundTotal($payment->id)) {
                     continue;
                 }
                 $query = DB::table('payment_adjustments')->where([
@@ -266,7 +267,7 @@ class PaymentAdjustmentService
         }
         $period = DB::table('subscription_periods')->where('payment_id', $paymentId)->value('status');
         if ($period === null) {
-            return [false, 'Tidak ada periode Premium yang tercatat untuk pembayaran ini. Peninjauan tetap terbuka dan tidak ada yang diubah.', 0];
+            return $this->planCloseWithoutPeriod($paymentId, $open, $restore, $confirm);
         }
         $resettled = $kinds->contains('settlement');
         if ($restore && $period === 'revoked' && ! $resettled) {
@@ -297,6 +298,25 @@ class PaymentAdjustmentService
         }
 
         return [true, "Ditutup: {$count} peninjauan; {$plan}.", $count];
+    }
+
+    private function planCloseWithoutPeriod(int $paymentId, Builder $open, bool $restore, bool $confirm): array
+    {
+        $refundsOnly = ! (clone $open)->where(fn ($query) => $query->where('source', '!=', 'midtrans')->orWhere('kind', '!=', 'partial_refund'))->exists();
+        if (! $refundsOnly || DB::table('payments')->where('id', $paymentId)->value('status') !== 'pending') {
+            return [false, 'Tidak ada periode Premium yang tercatat untuk pembayaran ini. Peninjauan tetap terbuka dan tidak ada yang diubah.', 0];
+        }
+        if ($restore) {
+            return [false, 'Pembayaran pending ini belum pernah mengaktifkan Premium, jadi tidak ada yang dapat dipulihkan. Peninjauan tetap terbuka dan tidak ada yang diubah.', 0];
+        }
+        $count = (clone $open)->count();
+        $plan = "menutup {$count} peninjauan; pembayaran tetap pending tanpa periode Premium";
+        if (! $confirm) {
+            return [true, "DRY-RUN, belum ada perubahan. Rencana: {$plan}. Tambahkan --confirm untuk menjalankan.", 0];
+        }
+        (clone $open)->update(['status' => 'resolved', 'updated_at' => now()]);
+
+        return [true, "Ditutup: {$count} peninjauan; pembayaran tetap pending tanpa periode Premium. Premium tidak diaktifkan.", $count];
     }
 
     public function manualRefund(int $paymentId, mixed $amount, mixed $reason, mixed $reference, bool $confirm): array
