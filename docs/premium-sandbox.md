@@ -184,6 +184,10 @@ Total refund lintas sumber adalah jumlah refund manual ditambah total Midtrans d
 
 Webhook `partial_refund` untuk pembayaran yang sudah `refunded` tetap memeriksa status Midtrans. Refund baru dicatat satu kali sebagai `pending_review` dengan alasan "Refund setelah refund penuh terdeteksi…" dan log `payment.refund_after_full_refund`. Status `refunded`, `subscriptions`, dan `subscription_periods` tidak diubah. Nominalnya ikut dalam total refund; snapshot kumulatif tanpa detail hanya dicatat jika melebihi total Midtrans yang sudah tersimpan. Notifikasi lain untuk pembayaran `refunded` tetap diabaikan.
 
+## A6 — refund sebagian pada pembayaran pending
+
+Jika pembayaran lokal masih `pending` tetapi status Midtrans `partial_refund`, webhook, sinkronisasi manual (`Perbarui status`), dan `payments:reconcile` memakai pencatatan A3 yang sama: detail `refund_key`, fallback kumulatif, konflik nominal, dan idempotensi. Refund dicatat sebagai `pending_review` dengan alasan "Refund sebagian pada pembayaran pending terdeteksi…" dan log `payment.refund_on_pending`. Pembayaran tetap `pending`, Premium tidak diaktifkan, dan `subscriptions` serta `subscription_periods` tidak diubah; daftar pembayaran menampilkan "Sedang ditinjau". Settlement yang datang kemudian mengikuti aturan lama: karena sudah ada adjustment, pembayaran tidak menjadi `paid` dan settlement dicatat sebagai peninjauan. Hasil `unverified` pada rekonsiliasi yang bukan gangguan Midtrans (HTTP 503) dicatat sebagai `payment.reconcile_unverified` berisi ID pembayaran dan kode status. `payments:review` belum dapat menutup peninjauan pembayaran pending karena belum ada periode Premium.
+
 Struktur field mengikuti [Get Transaction Status Midtrans](https://docs.midtrans.com/reference/get-transaction-status).
 
 Sinkronisasi payment paid dan rekonsiliasi refund merupakan pekerjaan terpisah. A3 mempertahankan refresh() dan pemilihan payment existing, sehingga pembayaran paid masih bergantung pada webhook untuk deteksi refund.

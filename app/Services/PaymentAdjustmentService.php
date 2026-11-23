@@ -135,7 +135,8 @@ class PaymentAdjustmentService
 
             return match (true) {
                 $changed === [] => 'unchanged',
-                $after => $this->flagRefundAfterFullRefund($payment, $changed),
+                $after => $this->flagRefundAnomaly($payment, $changed, 'Refund setelah refund penuh terdeteksi; periksa kemungkinan kelebihan refund.', 'payment.refund_after_full_refund'),
+                $current === 'pending' => $this->flagRefundAnomaly($payment, $changed, 'Refund sebagian pada pembayaran pending terdeteksi; Premium tidak diaktifkan sampai ditinjau.', 'payment.refund_on_pending'),
                 default => $this->settleRefundTotal($payment, $current, $refunded['total'], $changed, $details),
             };
         }, 3);
@@ -191,16 +192,15 @@ class PaymentAdjustmentService
         return $full ? 'refunded' : 'disputed';
     }
 
-    private function flagRefundAfterFullRefund(object $payment, array $changed): string
+    private function flagRefundAnomaly(object $payment, array $changed, string $note, string $event): string
     {
-        $note = 'Refund setelah refund penuh terdeteksi; periksa kemungkinan kelebihan refund.';
         foreach ($changed as $reference) {
             $query = DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans', 'reference' => $reference]);
             $reason = (string) (clone $query)->value('reason');
             $query->update(['status' => 'pending_review', 'updated_at' => now(),
                 'reason' => str_starts_with($reason, $note) ? $reason : mb_substr(trim("$note $reason"), 0, 255)]);
         }
-        DB::afterCommit(fn () => Log::warning('payment.refund_after_full_refund', ['payment_id' => $payment->id, 'source' => 'midtrans', 'status' => 'pending_review']));
+        DB::afterCommit(fn () => Log::warning($event, ['payment_id' => $payment->id, 'source' => 'midtrans', 'status' => 'pending_review']));
 
         return 'disputed';
     }

@@ -468,8 +468,9 @@ class PaymentReversalTest extends TestCase
 
         $never = User::factory()->create();
         $pending = $this->order($never);
-        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '1000.00'])->assertUnprocessable();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '1000.00'])->assertOk();
         $this->assertSame('pending', $this->state($pending));
+        $this->assertDatabaseHas('payment_adjustments', ['payment_id' => $pending->id, 'kind' => 'partial_refund', 'status' => 'pending_review', 'amount' => 1000]);
         $this->midtrans($pending, 'refund')->assertOk();
         $this->assertSame('refunded', $this->state($pending));
         $this->assertNull($this->period($pending));
@@ -842,6 +843,88 @@ class PaymentReversalTest extends TestCase
         $this->assertSame(2, collect($this->logged)->where('message', 'payment.refund_after_full_refund')->count());
         $this->assertConsistent();
         $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_after_full_refund']);
+    }
+
+    public function test_partial_refund_of_a_pending_payment_is_reviewed_without_granting_premium(): void
+    {
+        $user = User::factory()->create();
+        $paid = $this->pay($user);
+        [$pending, $synced, $reconciled] = [$this->order($user), $this->order($user), $this->order($user)];
+        $outsider = User::factory()->create();
+        $foreign = $this->pay($outsider);
+        $this->travel(1)->days();
+        $kept = [$this->period($paid), $this->ends($user), $this->state($foreign), $this->period($foreign), $this->ends($outsider)];
+        $current = fn () => [$this->period($paid), $this->ends($user), $this->state($foreign), $this->period($foreign), $this->ends($outsider)];
+        $rows = fn (object $payment) => DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->get()
+            ->map(fn ($row) => [$row->source, $row->kind, $row->status, $row->amount, $row->reason])->all();
+        $note = 'Refund sebagian pada pembayaran pending terdeteksi; Premium tidak diaktifkan sampai ditinjau.';
+        $first = ['refund_key' => 'k1', 'refund_amount' => '2000.00', 'reason' => 'Salah paket'];
+
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"]], $rows($pending));
+        $this->assertSame(['pending', null], [$this->state($pending), $this->period($pending)]);
+        $this->actingAs($user)->get('/langganan')->assertOk()->assertSee('Sedang ditinjau');
+
+        $once = $this->snapshot();
+        $this->midtrans($pending, 'partial_refund')->assertOk();
+        $this->notice($pending->order_id, 'settlement')->assertOk();
+        $this->notice($pending->order_id, 'pending')->assertOk();
+        $this->assertSame('pending', app(MidtransSandboxService::class)->sync($user->id, $pending->order_id));
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2500.00', 'refunds' => [array_replace($first, ['refund_amount' => '2500.00'])]])->assertUnprocessable();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.50', 'refunds' => []])->assertUnprocessable();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [['refund_amount' => '2000.00']]])->assertUnprocessable();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '5000.00', 'refunds' => []])->assertUnprocessable();
+        $this->artisan('payments:refund', ['payment' => $pending->id, '--amount' => '1000', '--reason' => 'uji', '--reference' => 'TRF-1', '--confirm' => true])
+            ->expectsOutputToContain('paid')->assertFailed();
+        $this->artisan('payments:review', ['payment' => $pending->id, '--revoke' => true, '--confirm' => true])->expectsOutputToContain('Tidak ada periode Premium')->assertFailed();
+        $this->assertSame($once, $this->snapshot());
+        $this->assertSame(['unchanged' => 1], app(MidtransSandboxService::class)->reconcile($pending->order_id));
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"]], $rows($pending));
+
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '1000.00', 'refunds' => []])->assertOk();
+        $this->midtrans($pending, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [$first]])->assertOk();
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"], ['midtrans', 'partial_refund', 'pending_review', 3500, $note]], $rows($pending));
+
+        $this->gateway[$synced->order_id] = ['transaction_status' => 'partial_refund', 'refund_amount' => '1500.00', 'refunds' => [['refund_key' => 'k2', 'refund_amount' => '1500.00']]] + $this->gateway[$synced->order_id];
+        $this->assertSame('pending', app(MidtransSandboxService::class)->sync($user->id, $synced->order_id));
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 1500, $note]], $rows($synced));
+        $this->gateway[$reconciled->order_id] = ['transaction_status' => 'partial_refund', 'refund_amount' => '1000.00', 'refunds' => [['refund_key' => 'k3', 'refund_amount' => '1000.00']]] + $this->gateway[$reconciled->order_id];
+        $this->assertSame(['disputed' => 1], app(MidtransSandboxService::class)->reconcile($reconciled->order_id));
+        $this->assertSame(['unchanged' => 1], app(MidtransSandboxService::class)->reconcile($reconciled->order_id));
+        $this->gateway[$reconciled->order_id]['refunds'][0]['refund_amount'] = '1200.00';
+        $this->gateway[$reconciled->order_id]['refund_amount'] = '1200.00';
+        $this->assertSame(['unverified' => 1], app(MidtransSandboxService::class)->reconcile($reconciled->order_id));
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 1000, $note]], $rows($reconciled));
+
+        $this->midtrans($pending, 'settlement', ['refunds' => []])->assertOk();
+        $this->assertSame('settlement', DB::table('payment_adjustments')->where('payment_id', $pending->id)->orderByDesc('id')->value('kind'));
+        $this->assertSame(['pending', null], [$this->state($pending), $this->period($pending)]);
+
+        $this->assertSame($kept, $current());
+        $this->assertSame(['pending', 'pending', 'pending'], [$this->state($pending), $this->state($synced), $this->state($reconciled)]);
+        $this->assertSame(0, DB::table('subscription_periods')->whereIn('payment_id', [$pending->id, $synced->id, $reconciled->id])->count());
+        $this->assertSame(0, DB::table('payment_adjustments')->whereIn('payment_id', [$paid->id, $foreign->id])->count());
+        $this->assertSame(4, collect($this->logged)->where('message', 'payment.refund_on_pending')->count());
+        $this->assertConsistent();
+        $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_on_pending', 'payment.reconcile_unverified']);
+    }
+
+    public function test_interleaved_webhook_refresh_and_reconcile_record_a_pending_refund_once(): void
+    {
+        $user = User::factory()->create();
+        $pending = $this->order($user);
+        $this->gateway[$pending->order_id] = ['transaction_status' => 'partial_refund', 'refund_amount' => '3500.00', 'refunds' => [
+            ['refund_key' => 'k1', 'refund_amount' => '2000.00'], ['refund_key' => 'k2', 'refund_amount' => '1500.00']]] + $this->gateway[$pending->order_id];
+        $this->during[$pending->order_id] = function () use ($user, $pending) {
+            $this->assertSame(['disputed' => 1], app(MidtransSandboxService::class)->reconcile($pending->order_id));
+            $this->assertSame('pending', app(MidtransSandboxService::class)->sync($user->id, $pending->order_id));
+        };
+        $this->notice($pending->order_id, 'partial_refund')->assertOk();
+        $this->assertSame([2000, 1500], DB::table('payment_adjustments')->where('payment_id', $pending->id)->orderBy('id')->pluck('amount')->all());
+        $this->assertSame(['pending', null, null], [$this->state($pending), $this->period($pending), $this->ends($user)]);
+        $this->assertSame(1, collect($this->logged)->where('message', 'payment.refund_on_pending')->count());
+        $this->assertConsistent();
     }
 
     public function test_interleaved_webhooks_and_manual_refund_keep_one_combined_limit(): void

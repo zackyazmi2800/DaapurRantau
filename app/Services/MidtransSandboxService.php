@@ -182,6 +182,9 @@ class MidtransSandboxService
                     $outcome = 'unverified';
                     $failures += $exception->getStatusCode() === 503 ? 1 : 0;
                     $this->touch($payment);
+                    if ($exception->getStatusCode() !== 503) {
+                        Log::warning('payment.reconcile_unverified', ['payment_id' => $payment->id, 'status' => $exception->getStatusCode()]);
+                    }
                 }
             } catch (Throwable $exception) {
                 if (SqliteContention::isBusy($exception)) {
@@ -279,6 +282,7 @@ class MidtransSandboxService
         $kind = match (true) {
             in_array($status, ['refund', 'chargeback'], true) => $status,
             $settled && in_array($status, ['partial_refund', 'partial_chargeback'], true) => $status,
+            $payment->status === 'pending' && $status === 'partial_refund' => $status,
             $settled && in_array($status, ['deny', 'cancel', 'expire', 'failure'], true) => 'reversal',
             default => null,
         };
