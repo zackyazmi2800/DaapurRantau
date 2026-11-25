@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Support\SqliteContention;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -22,7 +23,7 @@ class MidtransSandboxService
     {
         $client = $this->credential('client_key');
 
-        return $this->serverKeyReady() && filled($this->credential('signature_secret_key'))
+        return $this->serverKeyReady() && ($this->signatureSlots()['current']['state'] ?? null) === 'active'
             && ($this->environment() === 'production'
                 ? str_starts_with($client, 'Mid-client-')
                 // Both public Client Key formats are issued for Sandbox merchants.
@@ -69,9 +70,98 @@ class MidtransSandboxService
     private function credential(string $name): string
     {
         $environment = $this->environment();
-        $value = $environment ? config("midtrans.{$environment}.{$name}") : null;
+
+        return $environment ? $this->configured($environment, $name) : '';
+    }
+
+    private function configured(string $environment, string $name): string
+    {
+        $value = config("midtrans.{$environment}.{$name}");
 
         return is_string($value) ? trim($value) : '';
+    }
+
+    /**
+     * Signature Secret Key slots of the active environment (N5 rotation). A slot is "active" only when
+     * it can verify notifications: the previous key needs a valid current key and a deadline at most
+     * signature_rotation_max_hours ahead. A secret equal to any Server/Client Key or to the other
+     * environment's secrets is never used. Secret values are never part of the public state.
+     *
+     * @return array<string, array{state: string, secret?: string, until?: Carbon}>
+     */
+    private function signatureSlots(): array
+    {
+        $environment = $this->environment();
+        if ($environment === null) {
+            return [];
+        }
+        $forbidden = [];
+        foreach (['sandbox', 'production'] as $other) {
+            $names = $other === $environment ? ['server_key', 'client_key'] : ['server_key', 'client_key', 'signature_secret_key', 'signature_secret_key_previous'];
+            foreach ($names as $name) {
+                $forbidden[] = $this->configured($other, $name);
+            }
+        }
+        $reused = fn (string $secret) => collect($forbidden)->contains(fn (string $value) => $value !== '' && hash_equals($value, $secret));
+        $current = $this->configured($environment, 'signature_secret_key');
+        $slots['current'] = match (true) {
+            $current === '' => ['state' => 'missing'],
+            $reused($current) => ['state' => 'reused'],
+            default => ['state' => 'active', 'secret' => $current],
+        };
+        $previous = $this->configured($environment, 'signature_secret_key_previous');
+        $until = $this->rotationDeadline($this->configured($environment, 'signature_previous_until'));
+        $slots['previous'] = match (true) {
+            $previous === '' => ['state' => 'missing'],
+            $reused($previous) || ($current !== '' && hash_equals($current, $previous)) => ['state' => 'reused'],
+            $until === null => ['state' => 'no_deadline'],
+            $until->isPast() => ['state' => 'expired', 'until' => $until],
+            $until->gt(now()->addHours((int) config('midtrans.signature_rotation_max_hours', 168))) => ['state' => 'too_long', 'until' => $until],
+            $slots['current']['state'] !== 'active' => ['state' => 'no_current', 'until' => $until],
+            default => ['state' => 'active', 'secret' => $previous, 'until' => $until],
+        };
+
+        return $slots;
+    }
+
+    /** ISO-8601 with an explicit offset only, so a deadline is never read in an assumed timezone. */
+    private function rotationDeadline(string $value): ?Carbon
+    {
+        if (! preg_match('/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})\z/', $value)) {
+            return null;
+        }
+        try {
+            return Carbon::parse($value)->utc();
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Rotation state without secret values, for payments:signature-status.
+     *
+     * @return array{environment: ?string, current: string, previous: string, until: ?string}
+     */
+    public function signatureStatus(): array
+    {
+        $slots = $this->signatureSlots();
+
+        return ['environment' => $this->environment(), 'current' => $slots['current']['state'] ?? 'missing', 'previous' => $slots['previous']['state'] ?? 'missing',
+            'until' => isset($slots['previous']['until']) ? $slots['previous']['until']->toIso8601String() : null];
+    }
+
+    /** Slot whose key produced the SHA-512 notification signature, or null. Every active key is compared. */
+    private function signatureSlot(array $notice, array $slots): ?string
+    {
+        $matched = null;
+        foreach ($slots as $slot => $entry) {
+            if ($entry['state'] === 'active') {
+                $digest = hash('sha512', $notice['order_id'].$notice['status_code'].$notice['gross_amount'].$entry['secret']);
+                $matched = hash_equals($digest, $notice['signature_key']) && $matched === null ? $slot : $matched;
+            }
+        }
+
+        return $matched;
     }
 
     private function url(string $host, string $path): string
@@ -128,10 +218,24 @@ class MidtransSandboxService
     {
         abort_unless($this->webhookEnabled(), 404);
         $order = $notice['order_id'];
-        $secret = $this->credential('signature_secret_key');
-        abort_unless($this->environment() !== null && $secret !== '', 503);
-        $digest = hash('sha512', $order.$notice['status_code'].$notice['gross_amount'].$secret);
-        abort_unless(hash_equals($digest, $notice['signature_key']), 403);
+        $slots = $this->signatureSlots();
+        if (($slots['current']['state'] ?? null) !== 'active') {
+            // No usable Signature Secret Key: refuse without trying Server Key or Client Key.
+            Log::error('payment.webhook_signature_unconfigured', ['environment' => $this->environment(), 'current' => $slots['current']['state'] ?? 'missing']);
+            abort(503);
+        }
+        $slot = $this->signatureSlot($notice, $slots);
+        abort_if($slot === null, 403);
+        if ($slot === 'previous') {
+            Log::warning('payment.webhook_previous_signature_key', ['environment' => $this->environment(), 'until' => $slots['previous']['until']->toIso8601String()]);
+        }
+        if (! Str::isUuid($order)) {
+            // Signed by Midtrans but not an order of this application (e.g. Dashboard Test Notification).
+            Log::info('payment.webhook_foreign_order', ['environment' => $this->environment(), 'signature_slot' => $slot,
+                'transaction_status' => $notice['transaction_status'], 'order_hash' => substr(hash('sha256', $order), 0, 16)]);
+
+            return;
+        }
         $payment = DB::table('payments')->where('order_id', $order)->first();
         abort_unless($payment, 404);
         abort_unless($this->matchesAmount($notice['gross_amount'], $payment->amount), 422);

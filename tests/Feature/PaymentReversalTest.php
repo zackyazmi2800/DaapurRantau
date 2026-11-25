@@ -828,7 +828,8 @@ class PaymentReversalTest extends TestCase
         $this->notice($payment->order_id, 'settlement')->assertOk();
         $this->midtrans($payment, 'partial_refund', ['refund_amount' => '2500.00', 'refunds' => [['refund_key' => 'key-x', 'refund_amount' => '2500.00']]])->assertUnprocessable();
         $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'key-z', 'refund_amount' => '3500.00']]])->assertUnprocessable();
-        $refund($payment, '1', 'TRF-2')->expectsOutputToContain('paid')->assertFailed();
+        // Contract: an open manual/Midtrans reference conflict (key-x) stops every manual refund before any other check.
+        $refund($payment, '1', 'TRF-2')->expectsOutputToContain('konflik referensi refund manual dan Midtrans')->assertFailed();
         $this->assertSame($once, $this->snapshot());
 
         $this->midtrans($payment, 'partial_refund', ['refund_amount' => '3000.00', 'refunds' => [
@@ -841,8 +842,10 @@ class PaymentReversalTest extends TestCase
         $this->assertSame($kept, [$this->state($foreign), $this->period($foreign), $this->ends($outsider)]);
         $this->assertSame(0, DB::table('payment_adjustments')->where('payment_id', $foreign->id)->count());
         $this->assertSame(2, collect($this->logged)->where('message', 'payment.refund_after_full_refund')->count());
+        // 5000 manual + 3000 listed by Midtrans exceeds the 5000 payment: one durable excess alert.
+        $this->assertSame(1, collect($this->logged)->where('message', 'payment.refund_excess')->count());
         $this->assertConsistent();
-        $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_after_full_refund']);
+        $this->assertLogsAreSafe(['payment.adjustment', 'payment.refund_after_full_refund', 'payment.refund_excess']);
     }
 
     public function test_partial_refund_of_a_pending_payment_is_reviewed_without_granting_premium(): void
@@ -878,8 +881,13 @@ class PaymentReversalTest extends TestCase
             ->expectsOutputToContain('paid')->assertFailed();
         $this->artisan('payments:review', ['payment' => $pending->id, '--restore' => true, '--confirm' => true])->expectsOutputToContain('belum pernah mengaktifkan Premium')->assertFailed();
         $this->assertSame($once, $this->snapshot());
+        // Contract: a Get Status that is internally inconsistent (refund_amount without matching refunds[]) is unverified, never unchanged.
+        $this->assertSame(['unverified' => 1], app(MidtransSandboxService::class)->reconcile($pending->order_id));
+        $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"]], $rows($pending));
+        $this->gateway[$pending->order_id] = ['refund_amount' => '2000.00', 'refunds' => [$first]] + $this->gateway[$pending->order_id];
         $this->assertSame(['unchanged' => 1], app(MidtransSandboxService::class)->reconcile($pending->order_id));
         $this->assertSame([['midtrans', 'partial_refund', 'pending_review', 2000, "$note Salah paket"]], $rows($pending));
+        $this->assertSame(['pending', null], [$this->state($pending), $this->period($pending)]);
 
         $this->midtrans($pending, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
         $this->midtrans($pending, 'partial_refund', ['refund_amount' => '1000.00', 'refunds' => []])->assertOk();

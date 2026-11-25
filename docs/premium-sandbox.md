@@ -208,6 +208,7 @@ Environment Midtrans dipilih **hanya** lewat `MIDTRANS_ENVIRONMENT` (`sandbox` a
 | Server Key | `MIDTRANS_SERVER_KEY` (`SB-Mid-server-…`) | `MIDTRANS_PRODUCTION_SERVER_KEY` (`Mid-server-…`) |
 | Client Key | `MIDTRANS_CLIENT_KEY` | `MIDTRANS_PRODUCTION_CLIENT_KEY` (`Mid-client-…`) |
 | Signature Secret Key | `MIDTRANS_SIGNATURE_SECRET_KEY` | `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY` |
+| Signature Secret Key lama (rotasi, opsional) | `MIDTRANS_SIGNATURE_SECRET_KEY_PREVIOUS` + `MIDTRANS_SIGNATURE_PREVIOUS_UNTIL` | `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY_PREVIOUS` + `MIDTRANS_PRODUCTION_SIGNATURE_PREVIOUS_UNTIL` |
 | API (Get Status, Refund) | `https://api.sandbox.midtrans.com` | `https://api.midtrans.com` |
 | Snap | `https://app.sandbox.midtrans.com` | `https://app.midtrans.com` |
 
@@ -272,7 +273,7 @@ Migration `2026_11_25_000001_create_payment_gateway_refunds_table.php` sudah dis
 
 ### Webhook Production
 
-`POST /api/midtrans/notification` selalu terdaftar (aman untuk `route:cache`) dan mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Signature SHA-512 atas `order_id + status_code + gross_amount + Signature Secret Key` environment aktif dibandingkan dengan `hash_equals`. Payload notifikasi tidak dipercaya sebagai status: status selalu diambil ulang dari Get Status. Saat nonaktif, endpoint mengembalikan 404 sebelum validasi payload, sehingga request tidak valid tidak mengungkap keberadaannya lewat 422. Endpoint tidak memakai CSRF/sesi dan tidak mencatat signature atau credential. Rate limiter khusus `midtrans-webhook` (`MIDTRANS_WEBHOOK_RATE_LIMIT`, bawaan 120 request/menit per IP, key terpisah dari checkout) mengembalikan 429; Midtrans mengirim ulang notifikasi yang tidak dijawab 2xx. Di balik proxy, isi `TRUSTED_PROXIES` dengan IP/CIDR proxy yang sebenarnya (wildcard ditolak) agar IP asli dan HTTPS terdeteksi; lihat runbook. Webhook asli Midtrans belum pernah diterima karena belum ada endpoint publik yang disetujui.
+`POST /api/midtrans/notification` selalu terdaftar (aman untuk `route:cache`) dan mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Signature SHA-512 atas `order_id + status_code + gross_amount + Signature Secret Key` environment aktif dibandingkan dengan `hash_equals`; selama rotasi kunci lama terbatas (maks. 168 jam) juga diterima, dan order yang bukan UUID aplikasi (Test Notification Dashboard) dijawab 200 tanpa pemrosesan setelah signature lolos — lihat [operasional-pembayaran.md](operasional-pembayaran.md) bagian 7A–7B. Payload notifikasi tidak dipercaya sebagai status: status selalu diambil ulang dari Get Status. Saat nonaktif, endpoint mengembalikan 404 sebelum validasi payload, sehingga request tidak valid tidak mengungkap keberadaannya lewat 422. Endpoint tidak memakai CSRF/sesi dan tidak mencatat signature atau credential. Rate limiter khusus `midtrans-webhook` (`MIDTRANS_WEBHOOK_RATE_LIMIT`, bawaan 120 request/menit per IP, key terpisah dari checkout) mengembalikan 429; Midtrans mengirim ulang notifikasi yang tidak dijawab 2xx. Di balik proxy, isi `TRUSTED_PROXIES` dengan IP/CIDR proxy yang sebenarnya (wildcard ditolak) agar IP asli dan HTTPS terdeteksi; lihat runbook. Webhook asli Midtrans belum pernah diterima karena belum ada endpoint publik yang disetujui.
 
 ### Prosedur aktivasi Production
 

@@ -150,6 +150,19 @@ Artisan::command('payments:alert-status', function () {
     return $readiness['status'] === 'ready' || $readiness['status'] === 'disabled' ? 0 : 1;
 })->purpose('Periksa kesiapan alert pembayaran (log dan email) tanpa mengirim apa pun');
 
+Artisan::command('payments:signature-status', function (MidtransSandboxService $gateway) {
+    // Read-only: rotation state of the Signature Secret Key; never prints a key or a signature.
+    $status = $gateway->signatureStatus();
+    $labels = ['active' => 'aktif', 'missing' => 'kosong', 'reused' => 'DITOLAK: sama dengan Server/Client Key, kunci lama, atau secret environment lain',
+        'no_deadline' => 'DITOLAK: batas waktu kosong/tidak valid (ISO-8601 dengan zona waktu)', 'expired' => 'kedaluwarsa (tidak diterima lagi; hapus dari konfigurasi)',
+        'too_long' => 'DITOLAK: batas waktu lebih dari '.(int) config('midtrans.signature_rotation_max_hours', 168).' jam ke depan', 'no_current' => 'DITOLAK: kunci current tidak aktif'];
+    $this->line('Environment: '.($status['environment'] ?? 'nonaktif'));
+    $this->line('Signature Secret Key current: '.$labels[$status['current']]);
+    $this->line('Signature Secret Key previous: '.$labels[$status['previous']].($status['until'] ? " (batas {$status['until']})" : ''));
+
+    return $status['current'] === 'active' && in_array($status['previous'], ['missing', 'active', 'expired'], true) ? 0 : 1;
+})->purpose('Periksa status rotasi Signature Secret Key Midtrans tanpa menampilkan kunci');
+
 Artisan::command('payments:review {payment : ID pembayaran} {--restore} {--revoke} {--confirm}', function (PaymentAdjustmentService $adjustments) {
     $payment = DB::table('payments')->where('id', (int) $this->argument('payment'))->first();
     if (! $payment || $this->option('restore') === $this->option('revoke')) {

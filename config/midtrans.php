@@ -6,6 +6,8 @@ return [
     // Must be set explicitly to "sandbox" or "production"; anything else disables Midtrans.
     'environment' => is_string($environment) && trim($environment) !== '' ? strtolower(trim($environment)) : null,
     'webhook_enabled' => (bool) env('MIDTRANS_WEBHOOK_ENABLED', false),
+    // Hard upper bound for a Signature Secret Key rotation window; a later *_PREVIOUS_UNTIL disables the old key.
+    'signature_rotation_max_hours' => 168,
     'webhook_rate_limit' => max(10, min(1000, (int) env('MIDTRANS_WEBHOOK_RATE_LIMIT', 120))),
 
     // Hosts are fixed per environment so a misconfigured URL cannot redirect money flows.
@@ -13,6 +15,9 @@ return [
         'server_key' => env('MIDTRANS_SERVER_KEY', env('MIDTRANS_SANDBOX_SERVER_KEY')),
         'client_key' => env('MIDTRANS_CLIENT_KEY', env('MIDTRANS_SANDBOX_CLIENT_KEY')),
         'signature_secret_key' => env('MIDTRANS_SIGNATURE_SECRET_KEY'),
+        // Rotation (N5): the replaced key keeps verifying notifications until the given moment only.
+        'signature_secret_key_previous' => env('MIDTRANS_SIGNATURE_SECRET_KEY_PREVIOUS'),
+        'signature_previous_until' => env('MIDTRANS_SIGNATURE_PREVIOUS_UNTIL'),
         'api_url' => 'https://api.sandbox.midtrans.com',
         'snap_url' => 'https://app.sandbox.midtrans.com',
     ],
@@ -20,6 +25,8 @@ return [
         'server_key' => env('MIDTRANS_PRODUCTION_SERVER_KEY'),
         'client_key' => env('MIDTRANS_PRODUCTION_CLIENT_KEY'),
         'signature_secret_key' => env('MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY'),
+        'signature_secret_key_previous' => env('MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY_PREVIOUS'),
+        'signature_previous_until' => env('MIDTRANS_PRODUCTION_SIGNATURE_PREVIOUS_UNTIL'),
         'api_url' => 'https://api.midtrans.com',
         'snap_url' => 'https://app.midtrans.com',
     ],

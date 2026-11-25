@@ -265,6 +265,70 @@ class GatewayRefundTest extends TestCase
         Http::assertSentCount(1);
     }
 
+    public function test_signature_secret_rotation_accepts_the_previous_key_only_within_a_bounded_window(): void
+    {
+        $payment = $this->paid();
+        $logged = new \ArrayObject;
+        Event::listen(MessageLogged::class, fn ($event) => $logged->append([$event->message, $event->context]));
+        config(['midtrans.webhook_enabled' => true, 'midtrans.sandbox.signature_secret_key_previous' => 'old-signature',
+            'midtrans.sandbox.signature_previous_until' => '2026-01-03T00:00:00+07:00', 'midtrans.production.server_key' => 'Mid-server-prod-fixture']);
+        $gets = $this->gets;
+        $post = fn (string $secret, ?string $order = null) => $this->postJson('/api/midtrans/notification', ['order_id' => $order ?? $payment->order_id,
+            'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
+            'signature_key' => hash('sha512', ($order ?? $payment->order_id).'2005000.00'.$secret)]);
+        $status = fn () => $this->artisan('payments:signature-status');
+
+        $post('fixture-signature')->assertOk();
+        $post('old-signature')->assertOk();
+        $this->assertSame(1, collect($logged)->where(0, 'payment.webhook_previous_signature_key')->count());
+        foreach (['SB-Mid-server-fixture', 'SB-Mid-client-fixture', 'Mid-server-prod-fixture', ''] as $never) {
+            $post($never)->assertForbidden();
+        }
+        $status()->expectsOutputToContain('previous: aktif (batas 2026-01-02T17:00:00+00:00)')->assertSuccessful();
+
+        // Deadline passed, too far ahead, or without an explicit offset: the old key no longer verifies.
+        foreach (['2025-12-31T23:59:59Z' => 'kedaluwarsa', '2026-01-08T00:00:01Z' => 'lebih dari 168 jam', '2026-01-02 00:00:00' => 'batas waktu kosong'] as $until => $label) {
+            config(['midtrans.sandbox.signature_previous_until' => $until]);
+            $post('old-signature')->assertForbidden();
+            $post('fixture-signature')->assertOk();
+            $status()->expectsOutputToContain($label)->run();
+        }
+        // A previous key equal to the current key, a Server Key or the other environment's secret is never used.
+        config(['midtrans.sandbox.signature_previous_until' => '2026-01-02T00:00:00Z', 'midtrans.production.signature_secret_key' => 'prod-signature']);
+        foreach (['fixture-signature', 'Mid-server-prod-fixture', 'prod-signature'] as $reused) {
+            config(['midtrans.sandbox.signature_secret_key_previous' => $reused]);
+            $post($reused === 'fixture-signature' ? 'x' : $reused)->assertForbidden();
+            $status()->expectsOutputToContain('previous: DITOLAK: sama dengan')->assertFailed();
+        }
+        config(['midtrans.sandbox.signature_secret_key_previous' => 'old-signature']);
+        $post('old-signature')->assertOk();
+
+        // No usable current key: refused safely, the previous key alone never verifies.
+        foreach (['', 'SB-Mid-server-fixture', 'prod-signature'] as $current) {
+            config(['midtrans.sandbox.signature_secret_key' => $current]);
+            $post('old-signature')->assertServiceUnavailable();
+            $post($current)->assertServiceUnavailable();
+            $status()->assertFailed();
+            $this->assertFalse(app(MidtransSandboxService::class)->ready());
+        }
+        config(['midtrans.sandbox.signature_secret_key' => 'fixture-signature']);
+
+        // A notification signed for an order that is not ours (Dashboard Test Notification) is acknowledged without processing.
+        $before = [DB::table('payments')->count(), DB::table('payment_adjustments')->count()];
+        $post('fixture-signature', 'payment_notif_test_G000_x-1')->assertOk();
+        $post('wrong', 'payment_notif_test_G000_x-1')->assertForbidden();
+        $post('fixture-signature', 'bad order')->assertUnprocessable();
+        $this->assertSame(1, collect($logged)->where(0, 'payment.webhook_foreign_order')->count());
+        $this->assertSame($before, [DB::table('payments')->count(), DB::table('payment_adjustments')->count()]);
+        $this->assertSame($gets, $this->gets);
+        $this->assertSame(0, $this->posts);
+
+        $dump = json_encode($logged->getArrayCopy());
+        foreach (['fixture-signature', 'old-signature', 'prod-signature', 'SB-Mid-server-fixture', hash('sha512', $payment->order_id.'2005000.00fixture-signature')] as $secret) {
+            $this->assertStringNotContainsString($secret, $dump);
+        }
+    }
+
     public function test_unknown_refund_is_reattempted_only_with_the_same_key_amount_and_reason(): void
     {
         $payment = $this->paid();
@@ -806,7 +870,8 @@ class GatewayRefundTest extends TestCase
 
         config(['mail.default' => 'smtp', 'mail.mailers.smtp.host' => 'smtp.invalid', 'mail.from.address' => 'payments@dapurrantau.test']);
         $this->artisan('payments:alert-status')->expectsOutputToContain('siap melalui mailer smtp')->assertSuccessful();
-        $raise();
+        PaymentAlert::raise('payment.refund_excess', ['payment_id' => 1, 'reason' => 'alergi kacang', 'operator' => 'ops', 'status' => 'Mid-server-x', 'amount' => 5000]);
+        Mail::assertSent(PaymentAlertMail::class, fn (PaymentAlertMail $mail) => $mail->context === ['payment_id' => 1, 'amount' => 5000]);
         Mail::assertSent(PaymentAlertMail::class, 1);
         $this->assertSame([['payment.alert_mail', 'logged_only'], ['payment.alert_mail', 'failed'], ['payment.alert_mail', 'sent']],
             array_values(array_filter($logged->getArrayCopy(), fn ($row) => $row[0] === 'payment.alert_mail')));

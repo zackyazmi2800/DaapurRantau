@@ -22,7 +22,8 @@ class MidtransNotificationRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'order_id' => ['required', 'uuid'],
+            // Application orders are UUIDs; other signed orders (Dashboard Test Notification) are acknowledged only after the signature check.
+            'order_id' => ['required', 'string', 'max:100', 'regex:/\A[A-Za-z0-9_.~-]+\z/'],
             'gross_amount' => ['required', 'string', 'max:20'],
             'status_code' => ['required', 'string', 'digits:3'],
             'signature_key' => ['required', 'string', 'size:128'],

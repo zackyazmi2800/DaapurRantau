@@ -20,8 +20,13 @@ class PaymentAlert
 {
     private const REAL_TRANSPORTS = ['smtp', 'sendmail', 'ses', 'ses-v2', 'postmark', 'resend', 'mailgun'];
 
+    /** Only identifiers, amounts and short status words ever leave the application in an alert. */
+    private const CONTEXT_KEYS = ['payment_id', 'refund_id', 'gross', 'refunded', 'excess', 'amount', 'listed_amount', 'source', 'status'];
+
     public static function raise(string $event, array $context): void
     {
+        $context = array_filter(array_intersect_key($context, array_flip(self::CONTEXT_KEYS)),
+            fn ($value) => is_int($value) || (is_string($value) && preg_match('/\A[a-z_]{1,40}\z/', $value)));
         DB::afterCommit(function () use ($event, $context) {
             Log::error($event, $context + ['alert' => true]);
             $readiness = static::mailReadiness();

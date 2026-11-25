@@ -18,6 +18,7 @@ Konvensi: aplikasi berada di `/var/www/dapur-rantau` (sesuaikan), database Produ
 | `MIDTRANS_ENVIRONMENT` | `production` | Wajib eksplisit. |
 | `MIDTRANS_PRODUCTION_*` | dari Dashboard Production | Server Key: Snap Checkout **Write**, Core API **Read** (Get Status), capability **Refund transaction: Write**; tanpa izin Midtrans menjawab HTTP 403. Perhatikan tanggal kedaluwarsa Server Key. |
 | `PAYMENT_ALERT_EMAIL` | alamat operator | Opsional. Email alert hanya dikirim lewat transport nyata (`smtp`, `sendmail`, `ses`, `ses-v2`, `postmark`, `resend`, `mailgun`) dengan konfigurasi lengkap dan `MAIL_FROM_ADDRESS` nyata. Periksa dengan `php artisan payments:alert-status`. |
+| `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY_PREVIOUS`, `MIDTRANS_PRODUCTION_SIGNATURE_PREVIOUS_UNTIL` | kosong | Hanya selama rotasi Signature Secret Key (bagian 7A). Sandbox memakai `MIDTRANS_SIGNATURE_SECRET_KEY_PREVIOUS` dan `MIDTRANS_SIGNATURE_PREVIOUS_UNTIL`. |
 | `MIDTRANS_WEBHOOK_ENABLED` | `false` sampai bagian 7 selesai | |
 | `MIDTRANS_WEBHOOK_RATE_LIMIT` | `120` | Request per menit per IP klien asli (10–1000). |
 
@@ -116,6 +117,8 @@ Pengaman reattempt:
 
 ## 4A. Kebijakan penutupan refund `unknown` (two-person approval)
 
+> **Tinjauan Tahap 15:** tetap dinonaktifkan. `OperatorIdentity` hanya membuktikan akun OS (UID), bukan orang; `sudo -u`, `su`, root, dan siapa pun yang dapat menulis file SQLite atau menjalankan kode sebagai akun aplikasi dapat melewatinya. Nama operator CLI (`--operator`) tidak pernah dipakai sebagai bukti. Blocker yang harus selesai sebelum fitur ini boleh aktif di Production ada di bagian 4D; tanpa itu dual approval hanya akan menjadi keamanan semu.
+>
 > **Status: dinonaktifkan untuk Production.** Kedua perintah menolak bila `APP_ENV=production` atau `MIDTRANS_ENVIRONMENT=production`, tanpa variabel untuk menyalakannya. Di Production refund `unknown` tetap terbuka (slot ditahan) sampai Midtrans mencantumkannya dan `--reconcile` menyelesaikannya, atau sampai pemisahan kewenangan yang benar tersedia (bagian 4C). Alur di bawah hanya untuk lingkungan pengembangan dan pengujian prosedur.
 
 Penutupan hanya untuk refund yang **benar-benar** dikonfirmasi Midtrans tidak diproses. Tidak ada cara menutup refund karena operator menganggapnya gagal. Penutupan bukan bukti bahwa refund gagal: nominalnya tetap dicadangkan.
@@ -205,9 +208,38 @@ Verifikasi setelah deploy: request dari luar harus tercatat dengan IP klien asli
    - Aplikasi mengikuti perubahan 28 Oktober yang eksplisit dan Dashboard merchant Sandbox (menampilkan Signature Secret Key terpisah). Karena kedua halaman bertentangan dan belum ada notifikasi asli yang diterima, **webhook Production tetap nonaktif** sampai notifikasi uji dari Dashboard Production terbukti lolos verifikasi. Bila ternyata ditolak 403, jangan mengaktifkan fallback; perubahan rumus memerlukan perubahan kode dan review terpisah.
 3. Saat webhook nonaktif, endpoint mengembalikan 404 untuk semua request (sebelum validasi), sehingga keberadaannya tidak terlihat.
 4. Atur Payment Notification URL ke `https://<domain>/api/midtrans/notification`, lalu `MIDTRANS_WEBHOOK_ENABLED=true` dan `php artisan config:cache`.
-5. Kirim notifikasi uji dari Dashboard dan pastikan responsnya 200 atau 404 (order uji tidak ada di database), bukan 403 atau 503.
+5. Kirim notifikasi uji dari Dashboard (bagian 7B) dan pastikan responsnya 200 serta log `payment.webhook_foreign_order` muncul. 403 berarti signature tidak cocok (jangan mengaktifkan fallback), 503 berarti Signature Secret Key tidak dapat dipakai (`php artisan payments:signature-status`).
 
-Notifikasi tidak dipercaya sebagai status: aplikasi selalu memanggil Get Status. Replay notifikasi tidak berdampak karena semua transisi idempotent.
+Urutan pemrosesan (audit Tahap 15): (1) 404 bila webhook nonaktif, sebelum validasi; (2) limiter `midtrans-webhook` per IP klien asli (bergantung bagian 6); (3) validasi bentuk payload; (4) signature SHA-512 dengan Signature Secret Key environment aktif (`hash_equals`, tanpa Server/Client Key); (5) order bukan UUID aplikasi → 200 tanpa akses database pembayaran; (6) order dan nominal dicocokkan, lalu **Get Status** sebagai sumber data otoritatif. Notifikasi tidak dipercaya sebagai status. Refund Midtrans dicatat per `refund_key` (`partial_refund:key:<sha256>`), sehingga replay notifikasi tidak membuat adjustment ganda; semua transisi idempotent.
+
+## 7A. Rotasi Signature Secret Key (N5)
+
+Setiap environment punya slot sendiri; tidak ada slot bersama Sandbox/Production. Kunci yang sama dengan Server Key atau Client Key mana pun, atau dengan secret environment lain, ditolak (`reused`) dan tidak pernah dipakai. Bila kunci current kosong atau ditolak, webhook menjawab 503 dan checkout nonaktif; kunci previous saja tidak pernah cukup.
+
+| Slot | Variabel Production | Diterima bila |
+| --- | --- | --- |
+| current | `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY` | terisi dan tidak `reused` |
+| previous | `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY_PREVIOUS` + `MIDTRANS_PRODUCTION_SIGNATURE_PREVIOUS_UNTIL` | current aktif, berbeda dari current, batas waktu ISO-8601 dengan zona waktu (mis. `2026-12-01T10:00:00+07:00`) belum lewat dan **paling lama 168 jam** dari sekarang |
+
+Batas lebih dari 168 jam, tanpa zona waktu, atau tidak valid membuat kunci lama **tidak diterima** (bukan diperpanjang). Setiap notifikasi yang lolos dengan kunci lama dicatat `payment.webhook_previous_signature_key` (tanpa nilai kunci/signature) sebagai tanda rotasi belum tuntas.
+
+Prosedur:
+1. Backup `.env` secara aman di server (bukan ke repository) dan jalankan `php artisan payments:signature-status` (exit 0 = konfigurasi dapat dipakai).
+2. Pindahkan nilai current lama ke `*_PREVIOUS`, isi `*_PREVIOUS_UNTIL` (misalnya 48 jam ke depan, maksimum 168 jam), isi kunci baru dari Dashboard ke current, lalu `php artisan config:cache`.
+3. Segera rotasi kunci di Dashboard Midtrans. Selama transisi notifikasi lama/ulang (retry Midtrans) yang ditandatangani kunci lama tetap diterima.
+4. Pantau `payment.webhook_previous_signature_key`; setelah tidak muncul lagi dan sebelum batas waktu, **hapus** `*_PREVIOUS` dan `*_PREVIOUS_UNTIL`, `config:cache`, lalu `payments:signature-status` harus menampilkan previous `kosong`. Setelah batas lewat kunci lama otomatis ditolak (status `kedaluwarsa`), tetapi tetap hapus nilainya dari `.env`.
+5. Bila kunci bocor: jangan memakai masa transisi; ganti current, kosongkan previous, rotasi di Dashboard, dan tinjau notifikasi sejak kebocoran lewat Get Status (`payments:reconcile`).
+
+## 7B. Test Notification Dashboard Midtrans Sandbox (langkah manual)
+
+Status: **belum dijalankan**. Webhook asli belum pernah diterima; jangan menganggapnya berhasil sebelum langkah ini selesai dan log terverifikasi. Persyaratan yang harus Anda sediakan dan setujui lebih dulu (tidak dilakukan otomatis): URL HTTPS publik ke instance Sandbox (domain staging atau tunnel yang disetujui), `TRUSTED_PROXIES` sesuai proxy/tunnel itu, `MIDTRANS_ENVIRONMENT=sandbox`, `MIDTRANS_WEBHOOK_ENABLED=true`, dan Signature Secret Key Sandbox yang benar.
+
+1. `php artisan payments:signature-status` → current `aktif`, exit 0.
+2. Dashboard Sandbox → Settings → Payment → Notification URL: `https://<host-sandbox>/api/midtrans/notification`, lalu tombol **Test notification URL**.
+3. Hasil yang diharapkan: Dashboard menerima HTTP 200, log berisi `payment.webhook_foreign_order` dengan `signature_slot=current` (order uji Midtrans bukan UUID aplikasi; hanya hash order yang dicatat). Tidak ada perubahan tabel `payments`/`payment_adjustments` dan tidak ada Get Status.
+4. Bila 403: signature tidak cocok dengan Signature Secret Key (periksa kunci, atau rumus Midtrans berbeda — bagian 7 langkah 2); jangan menambah fallback Server Key. Bila 422: format payload uji berbeda dari yang diasumsikan (order_id hanya `A-Z a-z 0-9 _ . ~ -`, maks. 100 karakter); catat payload tanpa signature dan tinjau terpisah. Bila 429: limiter/proxy (bagian 6). Format payload uji Dashboard belum terverifikasi di proyek ini.
+5. Uji end-to-end opsional (memerlukan persetujuan transaksi Sandbox): satu pembayaran Sandbox, pastikan notifikasi `settlement` diproses dan status sama dengan Get Status.
+6. Setelah selesai, nonaktifkan kembali webhook atau URL bila endpoint publik tidak lagi disetujui.
 
 ## 8. Backup SQLite
 
@@ -305,20 +337,25 @@ Sudah tersedia di kode (terverifikasi dengan test/simulasi lokal):
 - [x] `payments:refund` merekonsiliasi refund Dashboard lewat Get Status sebelum mencatat (fail-closed).
 - [x] Rollback migration menolak menghapus histori pembayaran, periode langganan, refund, dan adjustment yang berisi data.
 - [x] `laravel/tinker` hanya dependensi development (`composer install --no-dev` tidak memasangnya).
-- [x] Status email alert jujur (`sent`/`logged_only`/`failed`) dan `payments:alert-status`.
+- [x] Status email alert jujur (`sent`/`logged_only`/`failed`) dan `payments:alert-status`; konteks alert dibatasi allowlist ID/nominal/status (Tahap 15).
+- [x] Rotasi Signature Secret Key (N5, bagian 7A): current + previous terbatas maks. 168 jam per environment, tanpa fallback Server/Client Key, `payments:signature-status`.
+- [x] Notifikasi bertanda tangan untuk order bukan UUID aplikasi (Test Notification) dijawab 200 tanpa pemrosesan.
+- [x] `composer audit` bersih (Tahap 15): `laravel/framework` v13.35.0 → v13.40.0, `symfony/http-foundation` v7.4.20 → v7.4.23, `symfony/http-kernel` v7.4.20 → v7.4.23, `symfony/routing` v7.4.20 → v7.4.23, `symfony/mime` v7.4.19 → v7.4.22, `phpseclib/phpseclib` 4.0.2 → 4.0.3. Hanya enam package ini yang berubah (tanpa dependency tambahan, tanpa perubahan `composer.json`/major version); versi dipilih yang menutup advisory dan sudah rilis ≥ 7 hari. Alasan: bypass host/proxy/path (Symfony HTTP/routing), header injection email (mime), task output injection `Concurrency` (framework, low), DoS parsing kunci (phpseclib via `laravel/socialite`).
 
 Belum diverifikasi / wajib dikerjakan saat persiapan:
 - [ ] Server Production: path `/var/lib/dapur-rantau/`, izin direktori hanya untuk akun aplikasi.
 - [ ] Nilai `TRUSTED_PROXIES`/`TRUSTED_PROXY_HEADERS` dari pemeriksaan infrastruktur nyata; HTTPS dan `APP_URL`.
 - [ ] Credential Production, permission Write Refund API, aktivasi refund merchant.
-- [ ] Rumus signature webhook Production dibuktikan dengan notifikasi uji Dashboard (dokumentasi Midtrans bertentangan, bagian 7).
+- [ ] Endpoint HTTPS publik yang disetujui untuk Sandbox, lalu Test Notification Dashboard Sandbox (bagian 7B) — **menunggu persetujuan dan konfigurasi eksternal**.
+- [ ] Rumus signature webhook Production dibuktikan dengan notifikasi uji Dashboard Production (dokumentasi Midtrans bertentangan, bagian 7).
 - [ ] `PAYMENT_ALERT_EMAIL` dan mailer Production, atau channel log alert lain; alert eksternal belum aktif.
-- [ ] Keputusan kebijakan peninjauan anomali `refund_excess` dan rancangan pemisahan kewenangan (bagian 4D).
-- [ ] Rotasi Signature Secret Key (N5): kode baru menerima satu kunci; notifikasi ulang dengan kunci lama ditolak 403 selama rotasi.
+- [ ] Keputusan kebijakan peninjauan anomali `refund_excess` dan rancangan pemisahan kewenangan (bagian 4D). Penutupan refund `unknown` Production tetap nonaktif sampai identitas operator dapat diverifikasi (bukan UID OS atau nama CLI).
+- [ ] Uji rotasi Signature Secret Key pada Sandbox dengan kunci nyata (fitur tersedia, belum diuji dengan Dashboard).
 - [ ] Volume persisten untuk `/var/lib/dapur-rantau` (EBS bila di EC2), pemantauan disk dan ukuran `-wal`.
 - [ ] Deploy Production memakai `composer install --no-dev --optimize-autoloader`; `php artisan tinker` tidak tersedia di Production.
 - [ ] Cron `schedule:run`, `LOG_LEVEL=info`, pemantauan log bagian 3, backup terjadwal di luar server, uji restore.
 - [ ] Webhook asli dan perilaku refund Production (`refund_method`, `bank_confirmed_at`).
-- [ ] Remediasi `composer audit` (Tahap 15, audit 2026-11-25: 9 advisory pada 6 package runtime). Naikkan secara terarah dengan `composer update <package> --with-dependencies` lalu jalankan test pembayaran/auth: `symfony/http-foundation`, `symfony/http-kernel`, `symfony/routing` 7.4.20 → ≥7.4.23 (host/proxy/path bypass; relevan bila `TRUSTED_PROXIES` diisi, `private_ranges` sudah tidak diterima `config/trustedproxy.php`), `symfony/mime` 7.4.19 → ≥7.4.22 (header injection email, medium), `laravel/framework` 13.35.0 → ≥13.40.0 (low; `Concurrency` tidak dipakai), `phpseclib/phpseclib` 4.0.2 → ≥4.0.3 (DoS parsing kunci, via `laravel/socialite`). Semua masih dalam constraint `composer.json` saat ini.
+- [ ] Jalankan `composer audit` lagi tepat sebelum deploy (advisory baru dapat terbit setelah Tahap 15).
+- [ ] Email alert diuji dengan satu pengiriman nyata yang disetujui (`payments:alert-status` hanya memeriksa konfigurasi).
 
 Dilarang sebelum persetujuan deployment: mengisi credential Production, mengaktifkan webhook Production, menjalankan migration atau restore pada database Production, mengirim transaksi atau refund Production.
