@@ -1,8 +1,10 @@
 <?php
 
 use App\Services\GatewayRefundService;
+use App\Services\ManualRefundService;
 use App\Services\MidtransSandboxService;
 use App\Services\PaymentAdjustmentService;
+use App\Support\PaymentAlert;
 use App\Support\SqliteContention;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
@@ -28,16 +30,16 @@ Artisan::command('payments:reconcile {--order=} {--limit=20}', function (Midtran
     return 0;
 })->purpose('Rekonsiliasi pembayaran pending dengan Midtrans');
 
-Artisan::command('payments:refund {payment : ID pembayaran} {--amount=} {--reason=} {--reference=} {--confirm}', function (PaymentAdjustmentService $adjustments) {
+Artisan::command('payments:refund {payment : ID pembayaran} {--amount=} {--reason=} {--reference=} {--confirm}', function (ManualRefundService $refunds) {
     try {
-        [$ok, $message] = $adjustments->manualRefund((int) $this->argument('payment'), $this->option('amount'), $this->option('reason'), $this->option('reference'), (bool) $this->option('confirm'));
+        [$ok, $message] = $refunds->refund((int) $this->argument('payment'), $this->option('amount'), $this->option('reason'), $this->option('reference'), (bool) $this->option('confirm'));
     } catch (Throwable $exception) {
         [$ok, $message] = SqliteContention::isBusy($exception) ? [false, 'Database sedang sibuk. Tidak ada yang dicatat, coba lagi.'] : throw $exception;
     }
     $ok ? $this->line($message) : $this->error($message);
 
     return $ok ? 0 : 1;
-})->purpose('Catat refund manual yang sudah ditransfer di luar Midtrans (tidak mengirim uang)');
+})->purpose('Catat refund manual yang sudah ditransfer di luar Midtrans (memeriksa Get Status lebih dulu, tidak mengirim uang)');
 
 Artisan::command('payments:gateway-refund {payment : ID pembayaran} {--amount=} {--reason=} {--refund-key= : Kunci unik refund (8-50 karakter)} {--operator= : Nama operator (default: user sistem)} {--confirm : Kirim refund sungguhan} {--confirm-production= : Ulangi order_id pembayaran untuk refund Production} {--reconcile : Cocokkan refund yang belum selesai dengan Get Status} {--reattempt : Ulangi refund pending/unknown dengan refund_key yang sama}', function (GatewayRefundService $refunds) {
     $payment = $this->argument('payment');
@@ -130,6 +132,23 @@ Artisan::command('payments:gateway-refund-close-approve {request : ID permintaan
 
     return $ok ? 0 : 1;
 })->purpose('Setujui penutupan refund unknown oleh operator kedua (akun OS berbeda; langkah 2 dari 2, tidak mengirim refund)');
+
+Artisan::command('payments:alert-status', function () {
+    // Read-only: reports whether alert email could really be delivered; never sends and never prints credentials.
+    $readiness = PaymentAlert::mailReadiness();
+    $this->line('Alert log: aktif (level error, alert=true).');
+    $this->line(match ($readiness['status']) {
+        'disabled' => 'Alert email: nonaktif (PAYMENT_ALERT_EMAIL kosong).',
+        'ready' => "Alert email: siap melalui mailer {$readiness['mailer']} ({$readiness['transport']}). Belum diuji dengan pengiriman nyata.",
+        'logged_only' => "Alert email: HANYA LOG (mailer {$readiness['mailer']}, transport {$readiness['transport']}); email tidak benar-benar dikirim.",
+        default => "Alert email: tidak dapat dikirim ({$readiness['status']}, mailer {$readiness['mailer']}).",
+    });
+    foreach ($readiness['issues'] as $issue) {
+        $this->warn("- {$issue}");
+    }
+
+    return $readiness['status'] === 'ready' || $readiness['status'] === 'disabled' ? 0 : 1;
+})->purpose('Periksa kesiapan alert pembayaran (log dan email) tanpa mengirim apa pun');
 
 Artisan::command('payments:review {payment : ID pembayaran} {--restore} {--revoke} {--confirm}', function (PaymentAdjustmentService $adjustments) {
     $payment = DB::table('payments')->where('id', (int) $this->argument('payment'))->first();

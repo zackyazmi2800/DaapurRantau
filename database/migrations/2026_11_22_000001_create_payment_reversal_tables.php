@@ -66,6 +66,12 @@ return new class extends Migration
 
     public function down(): void
     {
+        // Financial history is never dropped by a rollback: archive (sqlite3 .backup) and restore instead.
+        foreach (['payment_adjustments', 'subscription_periods'] as $table) {
+            if (Schema::hasTable($table) && DB::table($table)->exists()) {
+                throw new RuntimeException("Rollback dibatalkan: tabel {$table} berisi histori refund/pembayaran yang tidak boleh dihapus. Gunakan backup dan restore (docs/operasional-pembayaran.md bagian 9-10).");
+            }
+        }
         Schema::drop('payment_adjustments');
         Schema::drop('subscription_periods');
     }

@@ -8,18 +8,22 @@ use App\Services\GatewayRefundService;
 use App\Services\MidtransSandboxService;
 use App\Services\SubscriptionService;
 use App\Support\OperatorIdentity;
+use App\Support\PaymentAlert;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Foundation\Testing\TestCase;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
 class GatewayRefundTest extends TestCase
@@ -598,7 +602,9 @@ class GatewayRefundTest extends TestCase
         $logged = new \ArrayObject;
         Event::listen(MessageLogged::class, fn ($event) => $logged->append([$event->level, $event->message]));
         Mail::fake();
-        config(['midtrans.alerts.mail_to' => 'ops@example.test']);
+        // Faked SMTP mailer: nothing leaves the process.
+        config(['midtrans.alerts.mail_to' => 'ops@example.test', 'mail.default' => 'smtp', 'mail.mailers.smtp.host' => 'smtp.invalid', 'mail.mailers.smtp.port' => 587,
+            'mail.from.address' => 'payments@dapurrantau.test']);
         [$payment, $closed] = $this->closedRefund();
         $this->assertSame(['closed_unprocessed', null], [$closed->status, $closed->active_slot]);
 
@@ -701,5 +707,113 @@ class GatewayRefundTest extends TestCase
         $this->app['env'] = 'testing';
         $this->assertDatabaseCount('payment_gateway_refund_closures', 0);
         $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'unknown', 'active_slot' => $payment->id]);
+    }
+
+    public function test_manual_refund_reconciles_dashboard_refunds_first_and_fails_closed(): void
+    {
+        $payment = $this->paid();
+        // Two Dashboard refunds with the same amount but different refund_key values, webhook off.
+        $this->record($payment->order_id, 'dashboard-n1-a', 1500, 'Dashboard');
+        $this->record($payment->order_id, 'dashboard-n1-b', 1500, 'Dashboard');
+        $gets = $this->gets;
+        $this->manual($payment, '2001', 'TRF-N1-1')->expectsOutputToContain('Sisa yang dapat direfund: Rp2.000')->assertFailed();
+        $this->assertSame($gets + 1, $this->gets);
+        $this->assertSame([1500, 1500], DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans'])->orderBy('id')->pluck('amount')->all());
+        $this->assertDatabaseHas('payment_adjustments', ['payment_id' => $payment->id, 'reference' => 'partial_refund:key:'.hash('sha256', 'dashboard-n1-b')]);
+        $this->manual($payment, '2000', 'TRF-N1-1', false)->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        // Dashboard 1500 + 1500 + manual 2000 = the full payment: the existing full-refund lifecycle applies.
+        $this->manual($payment, '2000', 'TRF-N1-1')->expectsOutputToContain('Dicatat (refund penuh')->assertSuccessful();
+        $this->assertSame('refunded', DB::table('payments')->where('id', $payment->id)->value('status'));
+        $this->manual($payment, '2000', 'TRF-N1-1')->expectsOutputToContain('sudah dicatat')->assertSuccessful();
+        $this->assertSame(2, DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans'])->count());
+        $this->assertSame(0, $this->posts);
+
+        // Fail closed: unreachable, cumulative-only, inconsistent, duplicate key, missing config.
+        $other = $this->paid();
+        $order = $other->order_id;
+        $state = $this->status[$order];
+        foreach ([
+            'unreachable' => null,
+            'cumulative only' => ['transaction_status' => 'partial_refund', 'refund_amount' => '1000.00', 'refunds' => []],
+            'sum mismatch' => ['transaction_status' => 'partial_refund', 'refund_amount' => '2000.00', 'refunds' => [['refund_key' => 'x-1', 'refund_amount' => '1000.00']]],
+            'duplicate key' => ['transaction_status' => 'partial_refund', 'refund_amount' => '2000.00', 'refunds' => [['refund_key' => 'x-1', 'refund_amount' => '1000.00'], ['refund_key' => 'x-1', 'refund_amount' => '1000.00']]],
+            'missing key' => ['transaction_status' => 'partial_refund', 'refund_amount' => '1000.00', 'refunds' => [['refund_amount' => '1000.00']]],
+            'not settled' => ['transaction_status' => 'pending'],
+        ] as $case => $override) {
+            $this->during = $override === null ? fn () => throw new ConnectionException('timeout') : null;
+            $this->status[$order] = $override === null ? $state : $override + $state;
+            $this->manual($other, '100', 'TRF-N1-2')->expectsOutputToContain('sisa refund tidak dianggap tersedia')->assertFailed();
+        }
+        $this->status[$order] = $state;
+        config(['midtrans.environment' => null]);
+        $this->manual($other, '100', 'TRF-N1-2')->expectsOutputToContain('Konfigurasi Midtrans belum lengkap')->assertFailed();
+        config(['midtrans.environment' => 'sandbox']);
+        $this->assertSame(0, DB::table('payment_adjustments')->where('payment_id', $other->id)->count());
+        $this->assertSame(0, $this->posts);
+    }
+
+    public function test_rollback_refuses_to_drop_refund_history(): void
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-keep-01'])->assertFailed();
+        foreach (['2026_11_27_000001_create_payment_refund_events_and_anomalies', '2026_11_26_000001_create_payment_gateway_refund_closures_table',
+            '2026_11_25_000001_create_payment_gateway_refunds_table'] as $migration) {
+            try {
+                (require database_path("migrations/{$migration}.php"))->down();
+                $this->fail("{$migration} should refuse to drop history.");
+            } catch (\RuntimeException $exception) {
+                $this->assertStringContainsString('Rollback dibatalkan', $exception->getMessage());
+            }
+        }
+        try {
+            Artisan::call('migrate:rollback', ['--step' => 1]);
+            $this->fail('migrate:rollback should refuse.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Rollback dibatalkan', $exception->getMessage());
+        }
+        $this->assertSame([1, 2], [DB::table('payment_gateway_refunds')->count(), DB::table('payment_gateway_refund_events')->count()]);
+        $this->assertTrue(Schema::hasTable('payment_refund_anomalies'));
+
+        $this->manual($payment, '1', 'TRF-N2')->assertFailed();
+        DB::table('payment_adjustments')->insert(['payment_id' => $payment->id, 'kind' => 'partial_refund', 'source' => 'manual', 'status' => 'pending_review',
+            'amount' => 1, 'reference' => 'TRF-N2', 'created_at' => now(), 'updated_at' => now()]);
+        try {
+            (require database_path('migrations/2026_11_22_000001_create_payment_reversal_tables.php'))->down();
+            $this->fail('payment_adjustments should be kept.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('payment_adjustments', $exception->getMessage());
+        }
+    }
+
+    public function test_alert_mail_status_never_claims_a_log_only_delivery(): void
+    {
+        Mail::fake();
+        $logged = new \ArrayObject;
+        Event::listen(MessageLogged::class, fn ($event) => $logged->append([$event->message, $event->context['mail_status'] ?? null]));
+        $raise = fn () => PaymentAlert::raise('payment.refund_excess', ['payment_id' => 1]);
+
+        $this->artisan('payments:alert-status')->expectsOutputToContain('Alert email: nonaktif')->assertSuccessful();
+        config(['midtrans.alerts.mail_to' => 'ops@example.test', 'mail.default' => 'log']);
+        $raise();
+        $this->artisan('payments:alert-status')->expectsOutputToContain('HANYA LOG')->assertFailed();
+        config(['mail.default' => 'smtp', 'mail.mailers.smtp.host' => '', 'mail.from.address' => 'hello@example.com']);
+        $raise();
+        $this->artisan('payments:alert-status')->expectsOutputToContain('tidak dapat dikirim (incomplete')->assertFailed();
+        config(['mail.default' => 'failover']);
+        $this->artisan('payments:alert-status')->expectsOutputToContain('unsupported')->assertFailed();
+        Mail::assertNothingSent();
+
+        config(['mail.default' => 'smtp', 'mail.mailers.smtp.host' => 'smtp.invalid', 'mail.from.address' => 'payments@dapurrantau.test']);
+        $this->artisan('payments:alert-status')->expectsOutputToContain('siap melalui mailer smtp')->assertSuccessful();
+        $raise();
+        Mail::assertSent(PaymentAlertMail::class, 1);
+        $this->assertSame([['payment.alert_mail', 'logged_only'], ['payment.alert_mail', 'failed'], ['payment.alert_mail', 'sent']],
+            array_values(array_filter($logged->getArrayCopy(), fn ($row) => $row[0] === 'payment.alert_mail')));
+
+        // A failing transport is reported as failed and never breaks the caller.
+        Mail::shouldReceive('mailer')->andThrow(new \RuntimeException('smtp down'));
+        $raise();
+        $this->assertSame(['payment.alert_mail', 'failed'], array_values(array_filter($logged->getArrayCopy(), fn ($row) => $row[0] === 'payment.alert_mail'))[3]);
     }
 }

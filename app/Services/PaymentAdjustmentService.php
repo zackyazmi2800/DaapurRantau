@@ -436,24 +436,34 @@ class PaymentAdjustmentService
         return [true, "Ditutup: {$count} peninjauan; pembayaran tetap pending tanpa periode Premium. Premium tidak diaktifkan.", $count];
     }
 
-    public function manualRefund(int $paymentId, mixed $amount, mixed $reason, mixed $reference, bool $confirm): array
+    public function manualRefundInputError(mixed $amount, mixed $reason, mixed $reference): ?string
+    {
+        return match (true) {
+            ! is_string($amount) || ! ctype_digit($amount) || (int) $amount < 1 || strlen($amount) > 9 => 'Opsi --amount wajib berupa bilangan bulat rupiah yang lebih dari nol.',
+            ! is_string($reason) || trim($reason) === '' || mb_strlen($reason) > 255 => 'Opsi --reason wajib diisi (maksimal 255 karakter).',
+            ! is_string($reference) || trim($reference) === '' || mb_strlen($reference) > 100 => 'Opsi --reference wajib diisi dengan referensi transfer (maksimal 100 karakter).',
+            default => null,
+        };
+    }
+
+    /**
+     * Records a transfer made outside Midtrans. Callers pass the individual refunds[] amounts from a
+     * fresh Get Status ($listed) so refunds made in the Midtrans Dashboard are part of the limit.
+     *
+     * @param  array<string, int>|null  $listed
+     */
+    public function manualRefund(int $paymentId, mixed $amount, mixed $reason, mixed $reference, bool $confirm, ?array $listed = null): array
     {
         $payment = DB::table('payments')->where('id', $paymentId)->first();
         if (! $payment) {
             return [false, 'Pembayaran tidak ditemukan.'];
         }
-        if (! is_string($amount) || ! ctype_digit($amount) || (int) $amount < 1 || strlen($amount) > 9) {
-            return [false, 'Opsi --amount wajib berupa bilangan bulat rupiah yang lebih dari nol.'];
-        }
-        if (! is_string($reason) || trim($reason) === '' || mb_strlen($reason) > 255) {
-            return [false, 'Opsi --reason wajib diisi (maksimal 255 karakter).'];
-        }
-        if (! is_string($reference) || trim($reference) === '' || mb_strlen($reference) > 100) {
-            return [false, 'Opsi --reference wajib diisi dengan referensi transfer (maksimal 100 karakter).'];
+        if ($error = $this->manualRefundInputError($amount, $reason, $reference)) {
+            return [false, $error];
         }
         $amount = (int) $amount;
         $reference = trim($reference);
-        $plan = fn () => $this->planManualRefund($payment->id, $amount, trim($reason), $reference, $confirm);
+        $plan = fn () => $this->planManualRefund($payment->id, $amount, trim($reason), $reference, $confirm, $listed);
 
         return $confirm ? DB::transaction(function () use ($payment, $plan) {
             DB::table('users')->where('id', $payment->user_id)->update(['id' => DB::raw('id')]);
@@ -462,7 +472,7 @@ class PaymentAdjustmentService
         }, 3) : $plan();
     }
 
-    private function planManualRefund(int $paymentId, int $amount, string $reason, string $reference, bool $confirm): array
+    private function planManualRefund(int $paymentId, int $amount, string $reason, string $reference, bool $confirm, ?array $listed): array
     {
         $payment = DB::table('payments')->where('id', $paymentId)->first();
         $manual = DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'manual']);
@@ -489,7 +499,7 @@ class PaymentAdjustmentService
             return [false, 'Ada refund Midtrans (payments:gateway-refund) yang hasilnya belum pasti. Jalankan payments:gateway-refund --reconcile terlebih dahulu. Tidak ada yang dicatat.'];
         }
         // Same ledger as payments:gateway-refund, including amounts reserved by closed gateway refunds.
-        $exposure = $this->refundExposure($payment);
+        $exposure = $this->refundExposure($payment, $listed);
         $left = $exposure['remaining'];
         if ($amount > $left) {
             return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.')

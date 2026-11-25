@@ -2,6 +2,7 @@
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
@@ -39,6 +40,12 @@ return new class extends Migration
 
     public function down(): void
     {
+        // Financial history is never dropped by a rollback: archive (sqlite3 .backup) and restore instead.
+        foreach (['payment_gateway_refunds'] as $table) {
+            if (Schema::hasTable($table) && DB::table($table)->exists()) {
+                throw new RuntimeException("Rollback dibatalkan: tabel {$table} berisi histori refund/pembayaran yang tidak boleh dihapus. Gunakan backup dan restore (docs/operasional-pembayaran.md bagian 9-10).");
+            }
+        }
         Schema::drop('payment_gateway_refunds');
     }
 };

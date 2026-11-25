@@ -15,6 +15,7 @@ use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Request;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -595,6 +596,12 @@ class PremiumSubscriptionTest extends TestCase
     public function test_weekly_expiry_and_feature_rollback_preserve_existing_accounts(): void
     {
         $user = User::factory()->create();
+        $this->artisan('migrate:rollback', ['--step' => 5])->assertSuccessful();
+        $this->assertFalse(Schema::hasTable('payments'));
+        $this->assertDatabaseHas('users', ['id' => $user->id]);
+        $this->artisan('migrate')->assertSuccessful();
+        $this->assertDatabaseCount('subscription_plans', 2);
+
         $this->travelTo(Carbon::parse('2026-03-01 03:00 UTC'));
         $this->actingAs($user);
         $order = (string) Str::uuid();
@@ -606,16 +613,27 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertDatabaseHas('subscriptions', ['ends_at' => '2026-03-08 03:00:00']);
         $this->travel(7)->days();
         $this->getJson('/riwayat')->assertForbidden();
-        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_27_000001_create_payment_refund_events_and_anomalies.php', '--step' => 1])->assertSuccessful();
-        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_26_000001_create_payment_gateway_refund_closures_table.php', '--step' => 1])->assertSuccessful();
-        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_25_000001_create_payment_gateway_refunds_table.php', '--step' => 1])->assertSuccessful();
-        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_22_000001_create_payment_reversal_tables.php', '--step' => 1])->assertSuccessful();
-        $path = 'database/migrations/2026_11_21_000001_create_premium_tables.php';
-        $this->artisan('migrate:rollback', ['--path' => $path, '--step' => 1])->assertSuccessful();
+        foreach (['2026_11_27_000001_create_payment_refund_events_and_anomalies', '2026_11_26_000001_create_payment_gateway_refund_closures_table',
+            '2026_11_25_000001_create_payment_gateway_refunds_table'] as $migration) {
+            $this->artisan('migrate:rollback', ['--path' => "database/migrations/{$migration}.php", '--step' => 1])->assertSuccessful();
+        }
+        try {
+            Artisan::call('migrate:rollback', ['--path' => 'database/migrations/2026_11_22_000001_create_payment_reversal_tables.php', '--step' => 1]);
+            $this->fail('subscription_periods should be kept.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('Rollback dibatalkan: tabel subscription_periods', $exception->getMessage());
+        }
+        $this->assertDatabaseHas('migrations', ['migration' => '2026_11_22_000001_create_payment_reversal_tables']);
+        try {
+            (require database_path('migrations/2026_11_21_000001_create_premium_tables.php'))->down();
+            $this->fail('payments should be kept.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('Rollback dibatalkan: tabel payments', $exception->getMessage());
+        }
+        $this->assertSame([1, 1, 1], [DB::table('payments')->count(), DB::table('subscription_periods')->count(), DB::table('subscriptions')->count()]);
+        $this->assertTrue(Schema::hasColumn('recommendation_operations', 'daily_usage_id'));
         $this->assertDatabaseHas('users', ['id' => $user->id]);
-        $this->assertFalse(Schema::hasTable('payments'));
-        $this->artisan('migrate', ['--path' => $path])->assertSuccessful();
-        $this->assertDatabaseCount('subscription_plans', 2);
+        $this->artisan('migrate')->assertSuccessful();
     }
 
     public function test_outstanding_lease_claims_last_premium_slot_and_expiry_preserves_history(): void

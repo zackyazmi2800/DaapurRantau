@@ -187,6 +187,22 @@ class GatewayRefundService
                 ->orWhere('last_checked_at', '<=', now()->subDay()))));
     }
 
+    /**
+     * Applies an already fetched Get Status to every gateway refund of the payment and to the refund
+     * ledger. Read-only towards Midtrans. Throws HttpException when the data cannot be recorded, so
+     * callers can fail closed.
+     */
+    public function syncFromStatus(object $payment, array $current): void
+    {
+        foreach ($this->recheck()->where('payment_id', $payment->id)->orderBy('id')->get() as $intent) {
+            if ($intent->environment === $this->gateway->environment()) {
+                $this->verify($payment, $intent, $current);
+            }
+        }
+        $this->gateway->applyGatewayStatus($payment->id, $current);
+        $this->adjustments->flagRefundExcess(DB::table('payments')->where('id', $payment->id)->first(), $this->adjustments->listedRefunds($current), 'manual_refund_sync');
+    }
+
     /** @return list<array{0: string, 1: string, 2: string}> refund_key, status before, status after */
     private function reconcilePayment(object $payment, Collection $intents): array
     {

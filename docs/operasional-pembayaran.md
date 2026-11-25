@@ -17,7 +17,7 @@ Konvensi: aplikasi berada di `/var/www/dapur-rantau` (sesuaikan), database Produ
 | `TRUSTED_PROXY_HEADERS` | `x-forwarded` atau `forwarded` | Sesuai header yang dikirim proxy. |
 | `MIDTRANS_ENVIRONMENT` | `production` | Wajib eksplisit. |
 | `MIDTRANS_PRODUCTION_*` | dari Dashboard Production | Server Key: Snap Checkout **Write**, Core API **Read** (Get Status), capability **Refund transaction: Write**; tanpa izin Midtrans menjawab HTTP 403. Perhatikan tanggal kedaluwarsa Server Key. |
-| `PAYMENT_ALERT_EMAIL` | alamat operator | Opsional. Bila diisi dan mailer Production terkonfigurasi, anomali pembayaran juga dikirim lewat email aplikasi. |
+| `PAYMENT_ALERT_EMAIL` | alamat operator | Opsional. Email alert hanya dikirim lewat transport nyata (`smtp`, `sendmail`, `ses`, `ses-v2`, `postmark`, `resend`, `mailgun`) dengan konfigurasi lengkap dan `MAIL_FROM_ADDRESS` nyata. Periksa dengan `php artisan payments:alert-status`. |
 | `MIDTRANS_WEBHOOK_ENABLED` | `false` sampai bagian 7 selesai | |
 | `MIDTRANS_WEBHOOK_RATE_LIMIT` | `120` | Request per menit per IP klien asli (10–1000). |
 
@@ -68,7 +68,12 @@ Daftar menampilkan ID, pembayaran, order ID, `refund_key`, nominal, status, envi
 
 **Batas refund** dihitung satu kali untuk refund gateway maupun manual: refund Midtrans dihitung per `refund_key` (nominal individual `refunds[]` bila Get Status tersedia, lalu adjustment Midtrans, lalu baris refund gateway), ditambah refund manual, ditambah **cadangan** untuk refund gateway yang belum tercantum di Midtrans (`pending`, `submitted`, `unknown`, `closed_unprocessed`). Satu `refund_key` tidak pernah dihitung dua kali. Selama ada cadangan, refund manual tidak pernah dianggap refund penuh.
 
-**Peringatan (alert):** `payment.refund_excess`, `payment.gateway_refund_closed_unprocessed_but_listed`, dan `payment.gateway_refund_rejected_but_listed` dicatat di level **error** (`alert=true`). Bila `PAYMENT_ALERT_EMAIL` diisi, peristiwa yang sama dikirim lewat mailer aplikasi (`PaymentAlertMail`, hanya ID dan nominal). Tidak ada integrasi alert eksternal lain; untuk Slack, tambahkan channel `slack` ke `LOG_STACK` dan isi `LOG_SLACK_WEBHOOK_URL` (channel bawaan Laravel, belum diuji di proyek ini). Riwayat status setiap refund gateway tersimpan append-only di `payment_gateway_refund_events`.
+**Peringatan (alert):** `payment.refund_excess`, `payment.gateway_refund_closed_unprocessed_but_listed`, dan `payment.gateway_refund_rejected_but_listed` dicatat di level **error** (`alert=true`) — ini **alert lokal** yang selalu aktif. Email alert (`PaymentAlertMail`, hanya ID dan nominal) dicatat jujur di log `payment.alert_mail` dengan `mail_status`:
+- `sent`: transport email nyata menerima pesan (belum berarti sampai ke inbox);
+- `logged_only`: mailer `log`/`array`, email **tidak** benar-benar dikirim;
+- `failed`: konfigurasi tidak lengkap, transport tidak didukung (`failover`/`roundrobin` dapat berakhir di log), atau pengiriman gagal. Kegagalan alert tidak pernah menggagalkan proses pembayaran atau refund.
+
+`php artisan payments:alert-status` menampilkan kesiapan tanpa mengirim email dan tanpa menampilkan credential (exit 1 bila email diminta tetapi tidak dapat dikirim). Tidak ada integrasi alert eksternal lain; untuk Slack, tambahkan channel `slack` ke `LOG_STACK` dan isi `LOG_SLACK_WEBHOOK_URL` (channel bawaan Laravel, belum diuji di proyek ini). Riwayat status setiap refund gateway tersimpan append-only di `payment_gateway_refund_events`.
 
 Pantau log berikut (tanpa credential atau payload): `payment.gateway_refund` (level info; set `LOG_LEVEL=info`), `payment.gateway_refund_request_failed`, `payment.gateway_refund_adjustment_unverified`, `payment.gateway_refund_rejected_but_listed`, `payment.processing_failed`, `payment.refund_excess`, `payment.refund_reference_conflict`.
 
@@ -250,9 +255,21 @@ Urutan pada instalasi yang sudah berjalan: backup (bagian 8) → `php artisan do
 
 Migration SQLite yang gagal **tidak** dikembalikan otomatis. Pada simulasi, migration yang membuat tabel lalu gagal meninggalkan tabel parsial tanpa baris di tabel `migrations`, sehingga `migrate` berikutnya akan gagal di tempat yang sama. Pemulihan yang benar adalah restore backup pra-migration (bagian 9), bukan `migrate:rollback` atau menghapus tabel manual. Setelah restore, perbaiki penyebab di kode dan ulangi dari langkah backup.
 
-**Jangan** menjalankan `migrate:rollback` untuk `2026_11_25_000001_create_payment_gateway_refunds_table` setelah ada refund Production: `down()` menghapus tabel `payment_gateway_refunds` beserta seluruh jejak audit refund (refund_key, operator, nominal, status Midtrans). Hal yang sama berlaku untuk `2026_11_26_000001` (menghapus audit `payment_gateway_refund_closures` dan trigger immutabilitas) serta `2026_11_22_000001` (`payment_adjustments`, `subscription_periods`).
+**Perlindungan histori saat rollback (Tahap 14):** `down()` milik migration berikut **menolak** (exception "Rollback dibatalkan…", tanpa menghapus apa pun) bila tabel yang dilindunginya berisi data:
 
-Urutan migration pembayaran: `2026_11_21_000001` (premium) → `2026_11_22_000001` (reversal) → `2026_11_25_000001` (refund gateway) → `2026_11_26_000001` (audit penutupan dan trigger) → `2026_11_27_000001` (riwayat status refund dan anomali). `2026_11_26`, `2026_11_27`, dan migration Oktober `000006`/`000007` sengaja menolak driver selain SQLite. `down()` milik `2026_11_27` menghapus riwayat event dan anomali; jangan dijalankan setelah ada data Production.
+| Migration | Ditolak bila berisi data |
+| --- | --- |
+| `2026_11_27_000001` | `payment_refund_anomalies`, `payment_gateway_refund_events` |
+| `2026_11_26_000001` | `payment_gateway_refund_closures`, atau `payment_gateway_refunds` (agar trigger immutabilitas tidak terlepas dari histori yang ada) |
+| `2026_11_25_000001` | `payment_gateway_refunds` |
+| `2026_11_22_000001` | `payment_adjustments`, `subscription_periods` |
+| `2026_11_21_000001` | `payments` |
+
+Tidak ada cascade delete atau truncate; foreign key dan urutan dependensi tetap. Pemeriksaan dilakukan sebagai langkah pertama `down()`, sebelum perubahan skema apa pun, sehingga migration yang ditolak tetap tercatat di tabel `migrations` (tidak dianggap sudah di-rollback). Bila semua tabel kosong, rollback berjalan sesuai urutan dependensi (`27` → `26` → `25` → `22` → `21`). Karena SQLite tidak membungkus migration dalam satu transaksi, rollback beberapa langkah yang ditolak di tengah tetap meninggalkan migration yang sudah dibatalkan sebelumnya dalam keadaan rollback (hanya yang tabelnya kosong); selalu backup dulu (bagian 8). Tabel `subscriptions` (status Premium saat ini, dapat dibangun ulang dari `subscription_periods`) tidak termasuk daftar dan tetap terlindungi secara tidak langsung karena `2026_11_21` ditolak selama `payments` berisi data.
+
+**Archival dan pemulihan:** histori keuangan tidak pernah dihapus lewat aplikasi. Untuk mengembalikan skema, (1) backup dengan `sqlite3 .backup` beserta checksum, (2) simpan backup itu sebagai arsip permanen di luar server, (3) pulihkan dengan restore backup pra-migration (bagian 9), bukan `migrate:rollback`. Untuk membaca histori lama, buka salinan arsip secara read-only: `sqlite3 'file:/arsip/database-<waktu>.sqlite?mode=ro'`.
+
+Urutan migration pembayaran: `2026_11_21_000001` (premium) → `2026_11_22_000001` (reversal) → `2026_11_25_000001` (refund gateway) → `2026_11_26_000001` (audit penutupan dan trigger) → `2026_11_27_000001` (riwayat status refund dan anomali). `2026_11_26`, `2026_11_27`, dan migration Oktober `000006`/`000007` sengaja menolak driver selain SQLite. `down()` seluruh migration pembayaran menolak bila histori berisi data (tabel di atas); jangan mengandalkan rollback untuk Production, gunakan restore backup.
 
 ## 11. Emergency rollback
 
@@ -266,7 +283,7 @@ Setelah rollback apa pun, jalankan `php artisan payments:gateway-refunds` dan se
 
 ## 12. Database Production dan kompatibilitas
 
-Kode yang ada mendukung **SQLite saja**. Instruksi Tahap 12A menetapkan SQLite di satu server, sedangkan Tahap 12 Finalization menyebut keputusan belum final; konfirmasi akhir tetap diperlukan. Bila keputusan itu dibuka kembali:
+Kode yang ada mendukung **SQLite saja**. Keputusan disetujui pada Tahap 14: SQLite satu server pada persistent local storage, tanpa network filesystem; alasan, risiko, dan syarat migrasi ke PostgreSQL ada di [adr-database-production.md](adr-database-production.md). Status kompatibilitas:
 
 | Database | Status terverifikasi | Konsekuensi |
 | --- | --- | --- |
@@ -285,6 +302,10 @@ Sudah tersedia di kode (terverifikasi dengan test/simulasi lokal):
 - [x] Webhook nonaktif default, 404 sebelum validasi, SHA-512 + `hash_equals`, limiter khusus.
 - [x] Trusted proxy eksplisit tanpa wildcard.
 - [x] Prosedur backup `.backup`, restore, dan pemulihan migration gagal diuji pada database sementara.
+- [x] `payments:refund` merekonsiliasi refund Dashboard lewat Get Status sebelum mencatat (fail-closed).
+- [x] Rollback migration menolak menghapus histori pembayaran, periode langganan, refund, dan adjustment yang berisi data.
+- [x] `laravel/tinker` hanya dependensi development (`composer install --no-dev` tidak memasangnya).
+- [x] Status email alert jujur (`sent`/`logged_only`/`failed`) dan `payments:alert-status`.
 
 Belum diverifikasi / wajib dikerjakan saat persiapan:
 - [ ] Server Production: path `/var/lib/dapur-rantau/`, izin direktori hanya untuk akun aplikasi.
@@ -293,7 +314,11 @@ Belum diverifikasi / wajib dikerjakan saat persiapan:
 - [ ] Rumus signature webhook Production dibuktikan dengan notifikasi uji Dashboard (dokumentasi Midtrans bertentangan, bagian 7).
 - [ ] `PAYMENT_ALERT_EMAIL` dan mailer Production, atau channel log alert lain; alert eksternal belum aktif.
 - [ ] Keputusan kebijakan peninjauan anomali `refund_excess` dan rancangan pemisahan kewenangan (bagian 4D).
+- [ ] Rotasi Signature Secret Key (N5): kode baru menerima satu kunci; notifikasi ulang dengan kunci lama ditolak 403 selama rotasi.
+- [ ] Volume persisten untuk `/var/lib/dapur-rantau` (EBS bila di EC2), pemantauan disk dan ukuran `-wal`.
+- [ ] Deploy Production memakai `composer install --no-dev --optimize-autoloader`; `php artisan tinker` tidak tersedia di Production.
 - [ ] Cron `schedule:run`, `LOG_LEVEL=info`, pemantauan log bagian 3, backup terjadwal di luar server, uji restore.
 - [ ] Webhook asli dan perilaku refund Production (`refund_method`, `bank_confirmed_at`).
+- [ ] Remediasi `composer audit` (Tahap 15, audit 2026-11-25: 9 advisory pada 6 package runtime). Naikkan secara terarah dengan `composer update <package> --with-dependencies` lalu jalankan test pembayaran/auth: `symfony/http-foundation`, `symfony/http-kernel`, `symfony/routing` 7.4.20 → ≥7.4.23 (host/proxy/path bypass; relevan bila `TRUSTED_PROXIES` diisi, `private_ranges` sudah tidak diterima `config/trustedproxy.php`), `symfony/mime` 7.4.19 → ≥7.4.22 (header injection email, medium), `laravel/framework` 13.35.0 → ≥13.40.0 (low; `Concurrency` tidak dipakai), `phpseclib/phpseclib` 4.0.2 → ≥4.0.3 (DoS parsing kunci, via `laravel/socialite`). Semua masih dalam constraint `composer.json` saat ini.
 
 Dilarang sebelum persetujuan deployment: mengisi credential Production, mengaktifkan webhook Production, menjalankan migration atau restore pada database Production, mengirim transaksi atau refund Production.

@@ -546,7 +546,7 @@ class PaymentReversalTest extends TestCase
         $this->assertSame('refunded', $this->state($b));
         $this->assertSame(['revoked', '2026-01-02 00:00:00', '2026-01-02 00:00:00', 604800], $this->period($b));
         $this->assertNull(app(SubscriptionService::class)->active($user->id));
-        $this->assertSame($sent, Http::recorded()->count());
+        $this->assertSame([], Http::recorded()->slice($sent)->reject(fn ($pair) => $pair[0]->method() === 'GET')->all());
         $this->assertDatabaseCount('payments', 3);
         $this->assertLogsAreSafe(['payment.adjustment']);
         $this->assertConsistent();
@@ -584,7 +584,7 @@ class PaymentReversalTest extends TestCase
         $this->assertSame($once, $this->snapshot());
         $this->assertSame([['refund', 'manual', 'resolved', 5000]], $rows($a));
 
-        $this->midtrans($b, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+        $this->midtrans($b, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'b-1', 'refund_amount' => '3500.00']]])->assertOk();
         $open = $this->snapshot();
         $sent = Http::recorded()->count();
         foreach (['5000', '1501'] as $excess) {
@@ -594,13 +594,13 @@ class PaymentReversalTest extends TestCase
         $refund($b, '1500', 'TRF-B', false)->expectsOutputToContain('Rencana: refund penuh')->assertSuccessful();
         $this->assertSame($open, $this->snapshot());
         $refund($b, '1500', 'TRF-B')->expectsOutputToContain('Dicatat (refund penuh')->assertSuccessful();
-        $this->assertSame($sent, Http::recorded()->count());
+        $this->assertSame([], Http::recorded()->slice($sent)->reject(fn ($pair) => $pair[0]->method() === 'GET')->all());
         $this->assertSame([['partial_refund', 'midtrans', 'resolved', 3500], ['refund', 'manual', 'resolved', 1500]], $rows($b));
         $this->assertSame(['refunded', $revoked, $moved, '2026-01-09 00:00:00'], [$this->state($b), $this->period($b), $this->period($b2), $this->ends($mixed)]);
 
-        $this->midtrans($c, 'partial_refund', ['refund_amount' => '2000.00'])->assertOk();
-        $this->midtrans($c, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
-        $this->assertSame([3500], DB::table('payment_adjustments')->where('payment_id', $c->id)->orderBy('id')->pluck('amount')->all());
+        $this->midtrans($c, 'partial_refund', ['refund_amount' => '2000.00', 'refunds' => [['refund_key' => 'c-1', 'refund_amount' => '2000.00']]])->assertOk();
+        $this->midtrans($c, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'c-1', 'refund_amount' => '2000.00'], ['refund_key' => 'c-2', 'refund_amount' => '1500.00']]])->assertOk();
+        $this->assertSame([2000, 1500], DB::table('payment_adjustments')->where('payment_id', $c->id)->orderBy('id')->pluck('amount')->all());
         $refund($c, '1501', 'TRF-C1')->expectsOutputToContain('Sisa yang dapat direfund: Rp1.500')->assertFailed();
         $refund($c, '1000', 'TRF-C1', false)->expectsOutputToContain('Rencana: refund sebagian')->assertSuccessful();
         $refund($c, '1000', 'TRF-C1')->expectsOutputToContain('Dicatat (refund sebagian')->assertSuccessful();
@@ -610,7 +610,7 @@ class PaymentReversalTest extends TestCase
         $this->assertSame(['refunded', $revoked, $moved], [$this->state($c), $this->period($c), $this->period($c2)]);
 
         $refund($d, '1000', 'TRF-D1')->expectsOutputToContain('Dicatat (refund sebagian')->assertSuccessful();
-        $this->midtrans($d, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+        $this->midtrans($d, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'd-1', 'refund_amount' => '3500.00']]])->assertOk();
         $partial = $this->snapshot();
         $refund($d, '1000', 'TRF-D1')->expectsOutputToContain('sudah dicatat')->assertSuccessful();
         $refund($d, '1000', 'TRF-D1', false)->expectsOutputToContain('sudah dicatat')->assertSuccessful();
@@ -623,13 +623,13 @@ class PaymentReversalTest extends TestCase
         $this->assertSame(['refunded', $revoked, $moved], [$this->state($d), $this->period($d), $this->period($d2)]);
 
         $refund($e, '2000', 'TRF-E1')->assertSuccessful();
-        $this->midtrans($e, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+        $this->midtrans($e, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'e-1', 'refund_amount' => '3500.00']]])->assertOk();
         $refund($e, '1', 'TRF-E2', false)->expectsOutputToContain('paid')->assertFailed();
         $refund($e, '1', 'TRF-E2')->expectsOutputToContain('paid')->assertFailed();
         $this->assertSame([['partial_refund', 'manual', 'resolved', 2000], ['partial_refund', 'midtrans', 'pending_review', 3500]], $rows($e));
         $this->assertSame('refunded', $this->state($e));
 
-        $this->midtrans($f, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => []])->assertOk();
+        $this->midtrans($f, 'partial_refund', ['refund_amount' => '3500.00', 'refunds' => [['refund_key' => 'f-1', 'refund_amount' => '3500.00']]])->assertOk();
         $this->artisan('payments:review', ['payment' => $f->id, '--restore' => true, '--confirm' => true])->assertSuccessful();
         $this->assertSame([['partial_refund', 'midtrans', 'rejected', 3500]], $rows($f));
         $refund($f, '1501', 'TRF-F')->expectsOutputToContain('Sisa yang dapat direfund: Rp1.500')->assertFailed();
