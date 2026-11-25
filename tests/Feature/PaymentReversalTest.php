@@ -33,8 +33,8 @@ class PaymentReversalTest extends TestCase
         $this->assertSame(':memory:', DB::connection()->getDatabaseName());
         $this->artisan('migrate')->assertSuccessful();
         Http::preventStrayRequests();
-        config(['midtrans.is_production' => false, 'midtrans.signature_secret_key' => 'fixture-signature', 'midtrans.server_key' => 'SB-Mid-server-fixture',
-            'midtrans.client_key' => 'SB-Mid-client-fixture', 'logging.default' => 'null', 'app.debug' => false]);
+        config(['midtrans.environment' => 'sandbox', 'midtrans.webhook_enabled' => true, 'midtrans.sandbox.signature_secret_key' => 'fixture-signature', 'midtrans.sandbox.server_key' => 'SB-Mid-server-fixture',
+            'midtrans.sandbox.client_key' => 'SB-Mid-client-fixture', 'logging.default' => 'null', 'app.debug' => false]);
         $this->logged = new ArrayObject;
         Event::listen(MessageLogged::class, fn (MessageLogged $event) => $this->logged->append(['level' => $event->level, 'message' => $event->message] + $event->context));
         Http::fake(function ($request) {
@@ -74,7 +74,7 @@ class PaymentReversalTest extends TestCase
     private function notice(string $order, string $status, array $with = []): TestResponse
     {
         $payload = $with + ['order_id' => $order, 'status_code' => '200', 'gross_amount' => $this->gateway[$order]['gross_amount'] ?? '5000.00', 'transaction_status' => $status];
-        $payload['signature_key'] ??= hash('sha512', $payload['order_id'].$payload['status_code'].$payload['gross_amount'].config('midtrans.signature_secret_key'));
+        $payload['signature_key'] ??= hash('sha512', $payload['order_id'].$payload['status_code'].$payload['gross_amount'].config('midtrans.sandbox.signature_secret_key'));
 
         return $this->postJson('/api/midtrans/notification', $payload);
     }
@@ -1062,7 +1062,7 @@ class PaymentReversalTest extends TestCase
         $this->gateway[$payment->order_id] = ['transaction_status' => 'partial_refund', 'refund_amount' => '3500.00', 'refunds' => [
             ['refund_key' => 'key-1', 'refund_amount' => '2000.00'], ['refund_key' => 'key-2', 'refund_amount' => '1500.00']]] + $this->gateway[$payment->order_id];
         $payload = ['order_id' => $payment->order_id, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'partial_refund',
-            'signature_key' => hash('sha512', $payment->order_id.'2005000.00'.config('midtrans.signature_secret_key'))];
+            'signature_key' => hash('sha512', $payment->order_id.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))];
         $this->during[$payment->order_id] = function () use ($payment, $payload) {
             $this->assertSame([true, 'Dicatat (refund sebagian: dicatat untuk ditinjau, masa aktif Premium tidak diubah).'],
                 app(PaymentAdjustmentService::class)->manualRefund($payment->id, '2000', 'Permintaan pengguna', 'TRF-P', true));
@@ -1148,7 +1148,7 @@ class PaymentReversalTest extends TestCase
         $other = User::factory()->create();
         $raced = $this->order($other);
         $payload = ['order_id' => $raced->order_id, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
-            'signature_key' => hash('sha512', $raced->order_id.'2005000.00'.config('midtrans.signature_secret_key'))];
+            'signature_key' => hash('sha512', $raced->order_id.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))];
         $this->during[$raced->order_id] = fn () => app(MidtransSandboxService::class)->notify($payload);
         $this->notice($raced->order_id, 'settlement')->assertOk();
         $this->assertSame('paid', $this->state($raced));
@@ -1365,7 +1365,7 @@ class PaymentReversalTest extends TestCase
         $this->assertSame([4, 'failed'], [$logs(), $this->state($e)]);
         $this->gateway[$e->order_id] = ['transaction_status' => 'settlement', 'status_code' => '200', 'gross_amount' => '5000.00'];
         $payload = ['order_id' => $e->order_id, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
-            'signature_key' => hash('sha512', $e->order_id.'2005000.00'.config('midtrans.signature_secret_key'))];
+            'signature_key' => hash('sha512', $e->order_id.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))];
         try {
             DB::transaction(function () use ($payload, $e, $logs, $rows) {
                 app(MidtransSandboxService::class)->notify($payload);
@@ -1471,7 +1471,7 @@ class PaymentReversalTest extends TestCase
         $other = User::factory()->create();
         [$p, $q, $r] = [$this->order($other, 'legacy'), $this->order($other, 'legacy'), $this->order($other, 'legacy')];
         $payload = fn (object $payment) => ['order_id' => $payment->order_id, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
-            'signature_key' => hash('sha512', $payment->order_id.'2005000.00'.config('midtrans.signature_secret_key'))];
+            'signature_key' => hash('sha512', $payment->order_id.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))];
 
         $this->notice($p->order_id, 'settlement')->assertOk();
         $this->assertSame(['payment.review', $p->id, 0, 'review'], $seen[3]);

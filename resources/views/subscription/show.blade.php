@@ -13,10 +13,10 @@
     </div>
     @if ($checkout)
         <div class="mt-6" data-snap-checkout data-token="{{ $checkout }}" data-return-url="{{ route('subscription.show') }}">
-            <x-button id="open-snap">Buka pembayaran Sandbox</x-button>
+            <x-button id="open-snap">{{ $sandbox ? 'Buka pembayaran Sandbox' : 'Buka pembayaran' }}</x-button>
             <p class="mt-2 text-muted" role="status" id="snap-message"></p>
         </div>
-        <script defer src="https://app.sandbox.midtrans.com/snap/snap.js" data-client-key="{{ config('midtrans.client_key') }}"></script>
+        <script defer src="{{ $snapScript }}" data-client-key="{{ $clientKey }}"></script>
     @endif
     <h2 class="mt-10 text-xl font-bold">Pembayaran saya</h2>
     <ul class="mt-4 divide-y divide-line">

@@ -30,9 +30,9 @@
     </div>
     @auth
         @unless ($checkoutReady)
-            <p class="mt-6 text-sm text-muted">Pembelian tersedia setelah kunci Midtrans Sandbox dikonfigurasi.</p>
+            <p class="mt-6 text-sm text-muted">Pembelian tersedia setelah kunci Midtrans dikonfigurasi.</p>
         @endunless
     @endauth
-    <p class="mt-6 text-sm text-muted">Pembayaran simulasi melalui Midtrans Sandbox. Perpanjangan dilakukan manual.</p>
+    <p class="mt-6 text-sm text-muted">{{ $sandbox ? 'Pembayaran simulasi melalui Midtrans Sandbox.' : 'Pembayaran diproses melalui Midtrans.' }} Perpanjangan dilakukan manual.</p>
 </section>
 @endsection

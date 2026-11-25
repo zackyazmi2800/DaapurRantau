@@ -13,9 +13,9 @@ Halaman paket ada di `/paket`. Akun email terverifikasi dan akun Google dapat me
 
 1. Gunakan checkout lokal branch `feature/premium-sandbox`, PHP ≥8.3, dan SQLite development. Pastikan `APP_ENV=local`, `DB_CONNECTION=sqlite`, dan `DB_DATABASE` menunjuk ke file proyek lokal. Periksa juga override `DB_URL`. Simpan salinan cadangan konsisten dengan fasilitas backup SQLite sebelum migration.
 2. Pada instalasi existing, periksa `php artisan migrate:status`. Setelah migration fondasi aplikasi terpasang, jalankan perintah di bawah. Migration Premium menambahkan empat tabel dan satu kolom nullable pada operasi rekomendasi serta langsung mengisi dua paket. Pada instalasi development baru, jalankan seluruh migration dengan `php artisan migrate`.
-3. Pilih environment **Sandbox** di dashboard merchant Midtrans. Dari **Settings → Access Keys**, tetapkan `MIDTRANS_IS_PRODUCTION=false`, salin Server Key ke `MIDTRANS_SERVER_KEY`, Client Key ke `MIDTRANS_CLIENT_KEY` dan Signature Secret Key ke `MIDTRANS_SIGNATURE_SECRET_KEY` dalam `.env` lokal. Gunakan kunci dari merchant Sandbox yang sama, dengan izin Snap Checkout Write dan Core API Read untuk Server Key. [Access Keys Midtrans](https://docs.midtrans.com/docs/access-keys). Server memakai Basic Auth dan host Sandbox tetap. Browser hanya memerlukan Client Key untuk Snap. Pertahankan APP_KEY existing. Jalankan `php artisan config:clear` jika konfigurasi di-cache.
+3. Pilih environment **Sandbox** di dashboard merchant Midtrans. Dari **Settings → Access Keys**, tetapkan `MIDTRANS_ENVIRONMENT=sandbox` (wajib eksplisit; `MIDTRANS_IS_PRODUCTION` tidak dipakai lagi), salin Server Key ke `MIDTRANS_SERVER_KEY`, Client Key ke `MIDTRANS_CLIENT_KEY` dan Signature Secret Key ke `MIDTRANS_SIGNATURE_SECRET_KEY` dalam `.env` lokal. Gunakan kunci dari merchant Sandbox yang sama, dengan izin Snap Checkout Write dan Core API Read untuk Server Key. [Access Keys Midtrans](https://docs.midtrans.com/docs/access-keys). Server memakai Basic Auth dan host tetap per environment (lihat bagian Production di bawah). Browser hanya memerlukan Client Key untuk Snap. Pertahankan APP_KEY existing. Jalankan `php artisan config:clear` jika konfigurasi di-cache.
 4. Bangun aset dengan Node versi proyek dan `npm run build`, lalu mulai Laravel lokal. Buka `/paket`, masuk, pilih paket, dan periksa modal Snap. Gunakan metode pembayaran simulasi Sandbox.
-5. Untuk notifikasi, sediakan endpoint HTTPS publik dengan sertifikat valid yang meneruskan **hanya** POST `/api/midtrans/notification` ke aplikasi development. Atur **Payment Notification URL** pada pengaturan notifikasi Sandbox menjadi URL tersebut. Browser pembeli dapat tetap memakai localhost. Endpoint stateless terdaftar untuk local/testing. Form pembelian memakai sesi login dan CSRF biasa. Hindari mengekspos halaman debug development melalui tunnel publik.
+5. Untuk notifikasi, sediakan endpoint HTTPS publik dengan sertifikat valid yang meneruskan **hanya** POST `/api/midtrans/notification` ke aplikasi development. Atur **Payment Notification URL** pada pengaturan notifikasi Sandbox menjadi URL tersebut. Browser pembeli dapat tetap memakai localhost. Endpoint stateless selalu terdaftar tetapi mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Form pembelian memakai sesi login dan CSRF biasa. Hindari mengekspos halaman debug development melalui tunnel publik.
 
 ```sh
 php artisan migrate --path=database/migrations/2026_11_21_000001_create_premium_tables.php
@@ -195,3 +195,78 @@ Jika pembayaran lokal masih `pending` tetapi status Midtrans `partial_refund`, w
 Struktur field mengikuti [Get Transaction Status Midtrans](https://docs.midtrans.com/reference/get-transaction-status).
 
 Sinkronisasi payment paid dan rekonsiliasi refund merupakan pekerjaan terpisah. A3 mempertahankan refresh() dan pemilihan payment existing, sehingga pembayaran paid masih bergantung pada webhook untuk deteksi refund.
+
+## Sandbox dan Production (Tahap 9)
+
+Environment Midtrans dipilih **hanya** lewat `MIDTRANS_ENVIRONMENT` (`sandbox` atau `production`). Nilai kosong atau lain menonaktifkan checkout, rekonsiliasi, webhook dan refund (gagal aman, 503). Tidak ada fallback antar environment, dan `APP_ENV=production` menolak `sandbox` agar pembayaran simulasi tidak dapat mengaktifkan Premium.
+
+| | Sandbox | Production |
+| --- | --- | --- |
+| Server Key | `MIDTRANS_SERVER_KEY` (`SB-Mid-server-…`) | `MIDTRANS_PRODUCTION_SERVER_KEY` (`Mid-server-…`) |
+| Client Key | `MIDTRANS_CLIENT_KEY` | `MIDTRANS_PRODUCTION_CLIENT_KEY` (`Mid-client-…`) |
+| Signature Secret Key | `MIDTRANS_SIGNATURE_SECRET_KEY` | `MIDTRANS_PRODUCTION_SIGNATURE_SECRET_KEY` |
+| API (Get Status, Refund) | `https://api.sandbox.midtrans.com` | `https://api.midtrans.com` |
+| Snap | `https://app.sandbox.midtrans.com` | `https://app.midtrans.com` |
+
+Host ditetapkan di `config/midtrans.php`, bukan dari `.env`. Prefix kunci diperiksa: kunci Sandbox di slot Production (atau sebaliknya) ditolak. Signature Secret Key selalu terpisah dari Server Key; signature webhook tidak pernah dihitung dengan Server Key. Service membaca semuanya lewat `config()`; jalankan `php artisan config:clear` atau `config:cache` ulang setelah mengubah `.env`.
+
+**Permission Server Key.** Checkout memerlukan Snap Checkout Write; Get Transaction Status memerlukan Core API Read; **Refund API memerlukan akses Write** pada Core API (refund). Tanpa izin Write, Midtrans menolak refund (dicatat `rejected`, tidak ada uang bergerak). Pastikan juga fitur refund aktif untuk merchant Production (aktivasi melalui Midtrans support bila belum tersedia).
+
+### Refund langsung dari aplikasi: `payments:gateway-refund`
+
+Refund dikirim lewat Midtrans Refund API dari CLI; tidak ada halaman admin web. `payments:refund` tetap hanya **mencatat** refund manual di luar Midtrans.
+
+```sh
+# Dry-run (default): tidak mengirim apa pun, menampilkan sisa dan dampak Premium
+php artisan payments:gateway-refund 123 --amount=2000 --reason="Customer refund"
+# Eksekusi Sandbox
+php artisan payments:gateway-refund 123 --amount=2000 --reason="Customer refund" --confirm --refund-key=dr-refund-unique-001
+# Eksekusi Production: konfirmasi tambahan berupa order_id pembayaran
+php artisan payments:gateway-refund 123 --amount=2000 --reason="Customer refund" --confirm --refund-key=dr-refund-unique-001 --confirm-production=<order_id>
+# Rekonsiliasi refund yang belum selesai (hanya Get Status, tidak mengirim ulang)
+php artisan payments:gateway-refund 123 --reconcile
+```
+
+Operator dicatat dari `--operator` (default: user sistem). Validasi sebelum mengirim: pembayaran lokal `paid`; Get Status `settlement`/`partial_refund` dengan fraud `accept`; `payment_type` termasuk metode Refund API (`credit_card`, `gopay`, `shopeepay`, `dana`, `ovo`, `qris`, `kredivo`, `akulaku`; ShopeePay/OVO hanya refund penuh); `refund_amount` kumulatif sama dengan jumlah `refunds[]`; dan nominal ≤ sisa = pembayaran − refund Midtrans − refund manual. Metode lain (mis. Virtual Account) tetap memakai `payments:refund`.
+
+Alur dua fase:
+
+1. Get Status, validasi, hitung sisa (refund individual dari `refunds[]`, kumulatif dari `refund_amount`).
+2. Dalam transaksi database (lock baris akun/pembayaran) intent disimpan di `payment_gateway_refunds` dengan status `pending` dan `refund_key` sebelum request dikirim.
+3. Satu POST `/v2/{order_id}/refund` tanpa retry otomatis.
+4. Get Status lagi; entri `refunds[]` dicocokkan berdasarkan `refund_key`, nominal individualnya dibandingkan dengan intent, lalu status dan referensi Midtrans (`refund_chargeback_id`, `refund_chargeback_uuid`, `refund_method`, `created_at`, `bank_confirmed_at`) disimpan.
+5. Payload Get Status yang sama diterapkan lewat aturan penyesuaian yang sudah ada (referensi A3 `partial_refund:key:<sha256(refund_key)>`, batas A5, A6, R1, R2), sehingga webhook, `payments:reconcile` dan CLI tidak menggandakan penyesuaian. Refund penuh mencabut sisa Premium; refund sebagian tidak.
+6. Log `payment.gateway_refund` berisi ID, event, environment, nominal dan operator saja (tanpa credential, signature, reason atau payload).
+
+| Status | Arti | Slot refund |
+| --- | --- | --- |
+| `pending` | Intent tersimpan; hasil request belum tercatat (mis. proses terhenti) | Ditahan |
+| `submitted` | Midtrans menjawab 200, tetapi belum muncul di `refunds[]` | Ditahan |
+| `unknown` | Timeout, 5xx, 406, 429 atau respons tidak jelas | Ditahan |
+| `review` | Nominal di Midtrans berbeda dengan intent | Ditahan |
+| `succeeded` | Ada di `refunds[]`, `bank_confirmed_at` belum ada; dana **belum tentu** diterima pelanggan | Dibuka |
+| `confirmed` | `bank_confirmed_at` terisi | Dibuka |
+| `rejected` | Penolakan definitif (400–404, 410–414) dan tidak ada di `refunds[]` | Dibuka |
+
+**Idempotency.** `refund_key` unik global (unique index) dan tidak pernah dipakai ulang; kolom `active_slot` (unique, berisi `payment_id` selama request belum selesai) menjamin maksimal satu refund berjalan per pembayaran, termasuk saat dua operator menjalankan perintah bersamaan. `refund_key` yang sama dengan referensi refund manual atau refund Midtrans yang sudah tercatat ditolak. HTTP 200 tidak dianggap dana sudah diterima; hanya `bank_confirmed_at` yang menandai konfirmasi bank.
+
+**Timeout dan rekonsiliasi.** Timeout menghasilkan `unknown`. Jangan membuat `refund_key` baru dan jangan mengirim ulang; jalankan `--reconcile` sampai statusnya jelas. Midtrans mengizinkan reattempt dengan `refund_key` yang sama maksimal 7 hari, tetapi aplikasi sengaja tidak melakukannya otomatis. Tidak munculnya refund di Get Status, berapa pun lamanya, tidak membuktikan request tidak akan diproses, sehingga aplikasi **tidak menyediakan** cara melepas slot refund `pending`/`submitted`/`unknown`/`review`. Selama slot ditahan, refund gateway baru dan pencatatan manual `payments:refund` untuk pembayaran itu ditolak. Jika Midtrans (Dashboard atau support) memastikan request tidak akan pernah diproses, penyelesaiannya merupakan intervensi operator di database dengan backup dan catatan audit, di luar aplikasi.
+
+**Refund manual.** `payments:refund` tetap hanya mencatat transfer di luar Midtrans. Pencatatan ditolak selama ada refund gateway yang belum pasti, dan sisa yang dapat dicatat dihitung dari refund manual ditambah nilai terbesar antara refund Midtrans di `payment_adjustments` dan refund gateway `succeeded`/`confirmed`. Sebelum migration `payment_gateway_refunds` dijalankan, perintah ini tetap bekerja seperti sebelumnya.
+
+Migration `2026_11_25_000001_create_payment_gateway_refunds_table.php` sudah disiapkan tetapi **belum dijalankan** pada database development/production. Jalankan hanya setelah backup, pada target yang benar.
+
+### Webhook Production
+
+`POST /api/midtrans/notification` selalu terdaftar (aman untuk `route:cache`) dan mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Signature SHA-512 atas `order_id + status_code + gross_amount + Signature Secret Key` environment aktif dibandingkan dengan `hash_equals`. Payload notifikasi tidak dipercaya sebagai status: status selalu diambil ulang dari Get Status. Endpoint tidak memakai CSRF/sesi dan tidak mencatat signature atau credential. Rate limiter khusus `midtrans-webhook` (120 request/menit per IP, key terpisah dari checkout) mengembalikan 429; Midtrans mengirim ulang notifikasi yang tidak dijawab 2xx. Di balik proxy/CDN, konfigurasikan trusted proxies agar IP asli terbaca; tanpa itu semua notifikasi berbagi satu kuota. Webhook asli Midtrans belum pernah diterima karena belum ada endpoint publik yang disetujui.
+
+### Prosedur aktivasi Production
+
+1. Backup database target; jalankan migration yang tertunda (termasuk `payment_gateway_refunds`) dengan `php artisan migrate --force` pada target yang benar.
+2. Di Dashboard Midtrans **Production**: salin Server Key, Client Key dan Signature Secret Key ke `MIDTRANS_PRODUCTION_*` di `.env` server (bukan Git). Pastikan permission Server Key: Snap Write, Core API Read, dan Write untuk refund.
+3. Set `MIDTRANS_ENVIRONMENT=production`, `APP_ENV=production`, `APP_DEBUG=false`; biarkan `MIDTRANS_WEBHOOK_ENABLED=false` dulu. Jalankan `php artisan config:cache`.
+4. Atur Payment Notification URL Production ke `https://<domain>/api/midtrans/notification`, lalu set `MIDTRANS_WEBHOOK_ENABLED=true` dan `config:cache` ulang.
+5. Jadwalkan `php artisan schedule:run` (rekonsiliasi tiap 5 menit).
+6. Uji refund pertama dengan dry-run, lalu satu refund kecil yang disetujui dengan `--confirm-production`, dan pantau `--reconcile` sampai `confirmed`.
+
+Perilaku Production (mis. `refund_method` online/offline, waktu `bank_confirmed_at`) belum diverifikasi; fakta Sandbox (`refund_method=offline`, `bank_confirmed_at` langsung terisi) tidak boleh diasumsikan sama.

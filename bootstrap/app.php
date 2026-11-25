@@ -12,9 +12,9 @@ return Application::configure(basePath: dirname(__DIR__))
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
         then: function () {
-            if (app()->environment('local', 'testing')) {
-                \Illuminate\Support\Facades\Route::post('/api/midtrans/notification', [\App\Http\Controllers\SubscriptionController::class, 'notification']);
-            }
+            // Always registered (route:cache safe); disabled unless MIDTRANS_WEBHOOK_ENABLED=true.
+            \Illuminate\Support\Facades\Route::post('/api/midtrans/notification', [\App\Http\Controllers\SubscriptionController::class, 'notification'])
+                ->middleware('throttle:midtrans-webhook');
         },
     )
     ->withMiddleware(function (Middleware $middleware): void {

@@ -167,6 +167,7 @@ Aplikasi lulus QA lokal dan siap dipersiapkan untuk staging. Sebelum deployment:
 - Konfigurasikan HTTPS, document root public/, proxy tepercaya sesuai server, izin storage/bootstrap/cache/database dan backup database. Jangan mengekspos .env, storage log, vendor, .git atau SQLite lewat web.
 - Gunakan composer install --no-dev --optimize-autoloader, npm ci dan npm run build dalam proses rilis. Jangan menjalankan Vite dev server/public/hot pada production.
 - Backup sebelum migration; jalankan php artisan migrate --force pada target yang benar, lalu config:cache, route:cache, view:cache setelah konfigurasi final. Hindari cache:clear bersama tanpa kebutuhan.
+- Midtrans: set `MIDTRANS_ENVIRONMENT` secara eksplisit dan credential `MIDTRANS_PRODUCTION_*` terpisah dari Sandbox; webhook aktif hanya dengan `MIDTRANS_WEBHOOK_ENABLED=true`. Refund dari aplikasi memakai `php artisan payments:gateway-refund` (dry-run default) dan memerlukan Server Key dengan akses Write. Detail dan prosedur aktivasi: [docs/premium-sandbox.md](docs/premium-sandbox.md#sandbox-dan-production-tahap-9).
 - Uji HTTPS/cookie/proxy, ownership, cache, permission, versi PHP web dan database target di staging. Lakukan maksimal satu smoke API yang disepakati bila diperlukan; jangan menganggap fake membuktikan koneksi live.
 
 Deployment, pengujian MySQL, konfigurasi infrastruktur, load test dan audit penetrasi independen belum dilakukan. Mode lokal tetap APP_ENV=local/APP_DEBUG=true; itu bukan konfigurasi production.

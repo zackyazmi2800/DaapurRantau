@@ -14,7 +14,8 @@ class SubscriptionController extends Controller
 {
     public function pricing(MidtransSandboxService $gateway)
     {
-        return view('subscription.pricing', ['checkoutReady' => $gateway->ready(), 'plans' => DB::table('subscription_plans')->orderBy('price')->get()]);
+        return view('subscription.pricing', ['checkoutReady' => $gateway->ready(), 'sandbox' => $gateway->environment() !== 'production',
+            'plans' => DB::table('subscription_plans')->orderBy('price')->get()]);
     }
 
     public function show(Request $request, SubscriptionService $subscriptions, MidtransSandboxService $gateway)
@@ -29,6 +30,7 @@ class SubscriptionController extends Controller
 
         return view('subscription.show', [
             'active' => $subscriptions->active($userId), 'payments' => $payments, 'checkout' => $checkout,
+            'snapScript' => $gateway->snapScriptUrl(), 'clientKey' => $gateway->clientKey(), 'sandbox' => $gateway->environment() === 'sandbox',
             'used' => DB::table('daily_usages')->where('user_id', $userId)->where('usage_date', now('Asia/Jakarta')->toDateString())->value('successful_count') ?? 0,
         ]);
     }

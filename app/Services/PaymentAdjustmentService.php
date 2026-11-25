@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 class PaymentAdjustmentService
 {
@@ -215,7 +216,21 @@ class PaymentAdjustmentService
             ->where(['payment_id' => $paymentId, 'source' => 'midtrans', 'status' => 'pending_review'])->whereIn('reference', $references)->exists();
     }
 
-    private function refundTotal(int $paymentId): array
+    /** Sum of refunds sent through payments:gateway-refund that Midtrans has listed in refunds[]. */
+    public function gatewayRefunded(int $paymentId): int
+    {
+        return Schema::hasTable('payment_gateway_refunds') ? (int) DB::table('payment_gateway_refunds')
+            ->where('payment_id', $paymentId)->whereIn('status', ['succeeded', 'confirmed'])->sum('amount') : 0;
+    }
+
+    private function gatewayRefundOpen(int $paymentId): bool
+    {
+        // Any unresolved gateway request may still move money; its amount is unknown to the local ledger.
+        return Schema::hasTable('payment_gateway_refunds') && DB::table('payment_gateway_refunds')
+            ->where('payment_id', $paymentId)->whereIn('status', ['pending', 'submitted', 'unknown', 'review'])->exists();
+    }
+
+    public function refundTotal(int $paymentId): array
     {
         $manual = (int) DB::table('payment_adjustments')->where(['payment_id' => $paymentId, 'source' => 'manual'])->sum('amount');
         $midtrans = $this->midtransRefundTotal($paymentId);
@@ -365,7 +380,11 @@ class PaymentAdjustmentService
         if ($payment->status !== 'paid') {
             return [false, 'Hanya pembayaran berstatus paid yang dapat dicatat refund manualnya.'];
         }
-        $left = (int) $payment->amount - $this->refundTotal($payment->id)['total'];
+        if ($this->gatewayRefundOpen($payment->id)) {
+            return [false, 'Ada refund Midtrans (payments:gateway-refund) yang hasilnya belum pasti. Jalankan payments:gateway-refund --reconcile terlebih dahulu. Tidak ada yang dicatat.'];
+        }
+        $totals = $this->refundTotal($payment->id);
+        $left = (int) $payment->amount - $totals['manual'] - max($totals['midtrans'], $this->gatewayRefunded($payment->id));
         if ($amount > $left) {
             return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.').'.'];
         }

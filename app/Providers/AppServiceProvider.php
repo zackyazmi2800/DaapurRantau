@@ -38,6 +38,9 @@ class AppServiceProvider extends ServiceProvider
         RateLimiter::for('auth-resend', fn (Request $request) => $authLimit(3, 'resend:'.hash('sha256', $request->ip())));
         RateLimiter::for('auth-reset', fn (Request $request) => $authLimit(3, 'reset:'.hash('sha256', $request->ip())));
 
+        // Dedicated key space: never shared with checkout or other numeric throttles.
+        RateLimiter::for('midtrans-webhook', fn (Request $request) => Limit::perMinute(120)->by('midtrans-webhook:'.hash('sha256', (string) $request->ip())));
+
         RateLimiter::for('recipes', fn (Request $request) => Limit::perMinute(5)
             ->by(hash('sha256', $request->ip()))
             ->response(fn (Request $request, array $headers) => RecipeFailureResponse::make(

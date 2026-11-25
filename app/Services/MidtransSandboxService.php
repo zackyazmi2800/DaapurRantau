@@ -20,25 +20,73 @@ class MidtransSandboxService
 
     public function ready(): bool
     {
-        return $this->sandboxEnabled()
-            && filled(config('midtrans.signature_secret_key'))
-            && str_starts_with((string) config('midtrans.server_key'), 'SB-Mid-server-')
-            // Both public Client Key formats are issued for Sandbox merchants.
-            && Str::startsWith((string) config('midtrans.client_key'), ['SB-Mid-client-', 'Mid-client-']);
+        $client = $this->credential('client_key');
+
+        return $this->serverKeyReady() && filled($this->credential('signature_secret_key'))
+            && ($this->environment() === 'production'
+                ? str_starts_with($client, 'Mid-client-')
+                // Both public Client Key formats are issued for Sandbox merchants.
+                : Str::startsWith($client, ['SB-Mid-client-', 'Mid-client-']));
     }
 
-    private function sandboxEnabled(): bool
+    /** The explicitly configured gateway environment; never falls back to another one. */
+    public function environment(): ?string
     {
-        return app()->environment('local', 'testing') && config('midtrans.is_production') === false;
+        $environment = config('midtrans.environment');
+        if (! in_array($environment, ['sandbox', 'production'], true)) {
+            return null;
+        }
+
+        // A production application must never grant access from simulated payments.
+        return $environment === 'sandbox' && app()->environment('production') ? null : $environment;
+    }
+
+    public function webhookEnabled(): bool
+    {
+        return config('midtrans.webhook_enabled') === true;
+    }
+
+    public function serverKeyReady(): bool
+    {
+        $environment = $this->environment();
+        $key = $this->credential('server_key');
+
+        return $environment !== null && str_starts_with($key, $environment === 'production' ? 'Mid-server-' : 'SB-Mid-server-');
+    }
+
+    public function clientKey(): string
+    {
+        return $this->credential('client_key');
+    }
+
+    public function snapScriptUrl(): ?string
+    {
+        $environment = $this->environment();
+
+        return $environment ? config("midtrans.{$environment}.snap_url").'/snap/snap.js' : null;
+    }
+
+    private function credential(string $name): string
+    {
+        $environment = $this->environment();
+        $value = $environment ? config("midtrans.{$environment}.{$name}") : null;
+
+        return is_string($value) ? trim($value) : '';
+    }
+
+    private function url(string $host, string $path): string
+    {
+        $environment = $this->environment();
+        abort_if($environment === null, 503, 'Konfigurasi Midtrans belum tersedia.');
+
+        return config("midtrans.{$environment}.{$host}").$path;
     }
 
     private function serverKey(): string
     {
-        abort_unless($this->sandboxEnabled(), 503);
-        $key = (string) config('midtrans.server_key');
-        abort_unless(str_starts_with($key, 'SB-Mid-server-'), 503, 'Kunci Sandbox belum tersedia.');
+        abort_unless($this->serverKeyReady(), 503, 'Kunci Midtrans belum tersedia.');
 
-        return $key;
+        return $this->credential('server_key');
     }
 
     private function client(int $connect = 3, int $timeout = 8): PendingRequest
@@ -49,7 +97,7 @@ class MidtransSandboxService
 
     public function checkout(int $userId, string $code): string
     {
-        abort_unless($this->ready(), 503, 'Checkout menunggu konfigurasi kunci Sandbox.');
+        abort_unless($this->ready(), 503, 'Checkout menunggu konfigurasi kunci Midtrans.');
         $client = $this->client();
         $plan = DB::table('subscription_plans')->where('code', $code)->firstOrFail();
         $order = (string) Str::uuid();
@@ -58,7 +106,7 @@ class MidtransSandboxService
             'amount' => $plan->price, 'created_at' => now(), 'updated_at' => now(),
         ]);
         try {
-            $response = $client->post('https://app.sandbox.midtrans.com/snap/v1/transactions', [
+            $response = $client->post($this->url('snap_url', '/snap/v1/transactions'), [
                 'transaction_details' => ['order_id' => $order, 'gross_amount' => $plan->price],
                 'credit_card' => ['secure' => true],
             ]);
@@ -78,9 +126,10 @@ class MidtransSandboxService
 
     public function notify(array $notice): void
     {
+        abort_unless($this->webhookEnabled(), 404);
         $order = $notice['order_id'];
-        $secret = config('midtrans.signature_secret_key');
-        abort_unless($this->sandboxEnabled() && is_string($secret) && filled($secret), 503);
+        $secret = $this->credential('signature_secret_key');
+        abort_unless($this->environment() !== null && $secret !== '', 503);
         $digest = hash('sha512', $order.$notice['status_code'].$notice['gross_amount'].$secret);
         abort_unless(hash_equals($digest, $notice['signature_key']), 403);
         $payment = DB::table('payments')->where('order_id', $order)->first();
@@ -299,10 +348,47 @@ class MidtransSandboxService
         }, $reason];
     }
 
-    private function currentStatus(object $payment): ?array
+    /**
+     * Apply an already verified Get Status payload through the same adjustment rules as webhooks.
+     */
+    public function applyGatewayStatus(int $paymentId, array $current): ?string
+    {
+        return $this->settle(DB::table('payments')->where('id', $paymentId)->first(), $current);
+    }
+
+    /**
+     * Send one Refund API request. The caller must persist the refund intent first;
+     * this method never retries and reports an indeterminate result as "unknown".
+     */
+    public function requestRefund(object $payment, string $refundKey, int $amount, string $reason): array
+    {
+        $client = $this->client(3, 15);
+        $url = $this->url('api_url', "/v2/{$payment->order_id}/refund");
+        try {
+            $response = $client->post($url, ['refund_key' => $refundKey, 'amount' => $amount, 'reason' => $reason]);
+        } catch (ConnectionException) {
+            return ['outcome' => 'unknown', 'http_status' => null, 'status_code' => null];
+        }
+        $body = $response->json();
+        $code = is_array($body) && is_string($body['status_code'] ?? null) && preg_match('/\A[0-9]{3}\z/', $body['status_code']) ? $body['status_code'] : null;
+        $outcome = match (true) {
+            $response->successful() && $code === '200' && ($body['order_id'] ?? null) === $payment->order_id
+                && ($body['refund_key'] ?? null) === $refundKey => 'accepted',
+            // Only definitive rejections free the refund slot. 406 (duplicate refund key) means an
+            // earlier attempt may already exist; 429 and anything else stays unknown.
+            in_array($code, ['400', '401', '402', '403', '404', '410', '411', '412', '413', '414'], true) && ! $response->serverError() => 'rejected',
+            default => 'unknown',
+        };
+        $reference = is_array($body) ? ($body['refund_chargeback_id'] ?? null) : null;
+
+        return ['outcome' => $outcome, 'http_status' => $response->status(), 'status_code' => $code,
+            'refund_chargeback_id' => is_scalar($reference) ? mb_substr((string) $reference, 0, 100) : null];
+    }
+
+    public function currentStatus(object $payment): ?array
     {
         try {
-            $response = $this->client(2, 5)->get("https://api.sandbox.midtrans.com/v2/{$payment->order_id}/status");
+            $response = $this->client(2, 5)->get($this->url('api_url', "/v2/{$payment->order_id}/status"));
         } catch (ConnectionException) {
             abort(503, 'Status pembayaran belum dapat diverifikasi.');
         }

@@ -40,7 +40,7 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertSame(':memory:', DB::connection()->getDatabaseName());
         $this->artisan('migrate')->assertSuccessful();
         Http::preventStrayRequests();
-        config(['midtrans.is_production' => false, 'midtrans.signature_secret_key' => 'fixture-signature', 'midtrans.server_key' => 'SB-Mid-server-fixture', 'midtrans.client_key' => 'SB-Mid-client-fixture',
+        config(['midtrans.environment' => 'sandbox', 'midtrans.webhook_enabled' => true, 'midtrans.sandbox.signature_secret_key' => 'fixture-signature', 'midtrans.sandbox.server_key' => 'SB-Mid-server-fixture', 'midtrans.sandbox.client_key' => 'SB-Mid-client-fixture',
             'ai.gemini.api_key' => 'fake-only']);
     }
 
@@ -77,11 +77,11 @@ class PremiumSubscriptionTest extends TestCase
             $state = ['order_id' => $order, 'gross_amount' => '15000.00', 'status_code' => $code,
                 'transaction_status' => $status, 'fraud_status' => $fraud];
 
-            return $state + ['signature_key' => hash('sha512', $order.$code.'15000.00'.config('midtrans.signature_secret_key'))];
+            return $state + ['signature_key' => hash('sha512', $order.$code.'15000.00'.config('midtrans.sandbox.signature_secret_key'))];
         };
         $url = '/api/midtrans/notification';
         $this->postJson($url, array_merge($notice('settlement', '200'), ['signature_key' => str_repeat('0', 128)]))->assertForbidden();
-        $this->postJson($url, array_merge($state, ['gross_amount' => '1.00', 'signature_key' => hash('sha512', $order.'2001.00'.config('midtrans.signature_secret_key'))]))->assertUnprocessable();
+        $this->postJson($url, array_merge($state, ['gross_amount' => '1.00', 'signature_key' => hash('sha512', $order.'2001.00'.config('midtrans.sandbox.signature_secret_key'))]))->assertUnprocessable();
         foreach (['pending' => 'pending', 'deny' => 'failed', 'expire' => 'expired'] as $gateway => $expected) {
             $this->postJson($url, $notice($gateway, '201'))->assertOk();
             $this->assertDatabaseHas('payments', ['order_id' => $order, 'status' => $expected]);
@@ -122,15 +122,15 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertDatabaseHas('payments', ['amount' => 5000, 'status' => 'pending']);
         $order = DB::table('payments')->value('order_id');
         $notice = ['order_id' => $order, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement'];
-        $notice['signature_key'] = hash('sha512', $order.'2005000.00'.config('midtrans.server_key'));
+        $notice['signature_key'] = hash('sha512', $order.'2005000.00'.config('midtrans.sandbox.server_key'));
         $this->postJson('/api/midtrans/notification', $notice)->assertForbidden();
-        config(['midtrans.client_key' => 'Mid-client-fixture']);
+        config(['midtrans.sandbox.client_key' => 'Mid-client-fixture']);
         $this->get('/langganan?bayar='.$order)->assertOk()->assertSee('weekly-fixture')
             ->assertSee('data-client-key="Mid-client-fixture"', false);
-        config(['midtrans.client_key' => 'invalid-format']);
+        config(['midtrans.sandbox.client_key' => 'invalid-format']);
         $this->get('/langganan?bayar='.$order)->assertOk()->assertDontSee('weekly-fixture')->assertDontSee('invalid-format');
         $this->postJson('/langganan/checkout', ['plan' => 'weekly'])->assertServiceUnavailable();
-        config(['midtrans.client_key' => 'SB-Mid-client-fixture', 'midtrans.is_production' => true]);
+        config(['midtrans.sandbox.client_key' => 'SB-Mid-client-fixture', 'midtrans.environment' => 'production']);
         $this->postJson('/langganan/checkout', ['plan' => 'weekly'])->assertServiceUnavailable();
         $this->postJson('/api/midtrans/notification', $notice)->assertServiceUnavailable();
         Http::assertSentCount(1);
@@ -216,7 +216,7 @@ class PremiumSubscriptionTest extends TestCase
         $this->actingAs($user)->post('/langganan/checkout', ['plan' => 'weekly'])->assertStatus(303);
         $order = DB::table('payments')->value('order_id');
         $state = ['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => '200', 'transaction_status' => 'settlement', 'fraud_status' => 'accept'];
-        $notice = json_encode($state + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.signature_secret_key'))]);
+        $notice = json_encode($state + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))]);
         $webhook = fn () => $this->call('POST', '/api/midtrans/notification', [], [], [], ['CONTENT_TYPE' => 'application/json'], $notice);
         $sync = fn () => $this->post('/langganan/status', ['order_id' => $order])->assertRedirect('/langganan');
 
@@ -283,7 +283,7 @@ class PremiumSubscriptionTest extends TestCase
             return $order;
         };
         $settled = fn (string $order) => ['order_id' => $order, 'gross_amount' => '5000.00', 'currency' => 'IDR', 'status_code' => '200', 'transaction_status' => 'settlement', 'fraud_status' => 'accept'];
-        $notify = fn (string $order) => $this->postJson('/api/midtrans/notification', $settled($order) + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.signature_secret_key'))]);
+        $notify = fn (string $order) => $this->postJson('/api/midtrans/notification', $settled($order) + ['signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))]);
         $status = fn (string $order) => DB::table('payments')->where('order_id', $order)->value('status');
         $reconcile = fn () => app(MidtransSandboxService::class)->reconcile();
         [$review, $lunas, $kosong, $gagal, $lewat] = [$payment($legacy), $payment($weekly), $payment($weekly), $payment($weekly, 'failed'), $payment($weekly, 'expired')];
@@ -368,7 +368,7 @@ class PremiumSubscriptionTest extends TestCase
             ->assertSee('href="'.route('home').'"', false)->assertDontSee('Pembayaran')->assertDontSee('fixture-raw-detail');
         $this->assertSame([], DB::getQueryLog());
         DB::disableQueryLog();
-        config(['midtrans.is_production' => true]);
+        config(['midtrans.environment' => 'production']);
         $notice = ['order_id' => (string) Str::uuid(), 'gross_amount' => '5000.00', 'status_code' => '200', 'transaction_status' => 'settlement', 'signature_key' => str_repeat('0', 128)];
         $this->call('POST', '/api/midtrans/notification', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode($notice))
             ->assertServiceUnavailable()->assertHeader('Content-Type', 'application/json')->assertExactJson(['message' => '']);
@@ -394,7 +394,10 @@ class PremiumSubscriptionTest extends TestCase
         $before = $row();
         $working = config('midtrans');
 
-        foreach ([['is_production' => true], ['server_key' => null], ['server_key' => 'Mid-server-fixture'], ['signature_secret_key' => ''], ['client_key' => null]] as $broken) {
+        $sandbox = fn (array $broken) => ['sandbox' => $broken + $working['sandbox']];
+        foreach ([['environment' => 'production'], ['environment' => null], ['environment' => 'Sandbox-typo'], $sandbox(['server_key' => null]), $sandbox(['server_key' => 'Mid-server-fixture']),
+            $sandbox(['signature_secret_key' => '']), $sandbox(['client_key' => null]),
+            ['environment' => 'production', 'production' => ['server_key' => 'SB-Mid-server-fixture', 'client_key' => 'Mid-client-x', 'signature_secret_key' => 'x'] + $working['production']]] as $broken) {
             config(['midtrans' => $broken + $working]);
             $this->assertSame(['inactive' => 1], $reconcile());
             $this->artisan('payments:reconcile', ['--order' => $order])->expectsOutputToContain('inactive=1')->assertSuccessful();
@@ -482,7 +485,7 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertTrue(Cache::lock('payments:reconcile', 120)->get());
         $states[$menunggu] = ['200', 'settlement'];
         $this->postJson('/api/midtrans/notification', ['order_id' => $menunggu, 'status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
-            'fraud_status' => 'accept', 'signature_key' => hash('sha512', $menunggu.'2005000.00'.config('midtrans.signature_secret_key'))])->assertOk();
+            'fraud_status' => 'accept', 'signature_key' => hash('sha512', $menunggu.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))])->assertOk();
         $this->actingAs($user)->post('/langganan/status', ['order_id' => $menunggu])->assertSessionHas('status_type', 'success');
         $this->assertDatabaseHas('subscriptions', ['user_id' => $user->id, 'ends_at' => '2026-01-24 00:00:00']);
         Cache::lock('payments:reconcile')->forceRelease();
@@ -597,12 +600,13 @@ class PremiumSubscriptionTest extends TestCase
         $order = (string) Str::uuid();
         DB::table('payments')->insert(['user_id' => $user->id, 'plan_id' => 1, 'order_id' => $order, 'amount' => 5000]);
         $payload = ['status_code' => '200', 'gross_amount' => '5000.00', 'transaction_status' => 'settlement',
-            'order_id' => $order, 'signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.signature_secret_key'))];
+            'order_id' => $order, 'signature_key' => hash('sha512', $order.'2005000.00'.config('midtrans.sandbox.signature_secret_key'))];
         Http::fake(["https://api.sandbox.midtrans.com/v2/{$order}/status" => Http::response($payload)]);
         $this->postJson('/api/midtrans/notification', $payload)->assertOk();
         $this->assertDatabaseHas('subscriptions', ['ends_at' => '2026-03-08 03:00:00']);
         $this->travel(7)->days();
         $this->getJson('/riwayat')->assertForbidden();
+        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_25_000001_create_payment_gateway_refunds_table.php', '--step' => 1])->assertSuccessful();
         $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_22_000001_create_payment_reversal_tables.php', '--step' => 1])->assertSuccessful();
         $path = 'database/migrations/2026_11_21_000001_create_premium_tables.php';
         $this->artisan('migrate:rollback', ['--path' => $path, '--step' => 1])->assertSuccessful();
