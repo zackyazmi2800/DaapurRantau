@@ -606,6 +606,8 @@ class PremiumSubscriptionTest extends TestCase
         $this->assertDatabaseHas('subscriptions', ['ends_at' => '2026-03-08 03:00:00']);
         $this->travel(7)->days();
         $this->getJson('/riwayat')->assertForbidden();
+        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_27_000001_create_payment_refund_events_and_anomalies.php', '--step' => 1])->assertSuccessful();
+        $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_26_000001_create_payment_gateway_refund_closures_table.php', '--step' => 1])->assertSuccessful();
         $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_25_000001_create_payment_gateway_refunds_table.php', '--step' => 1])->assertSuccessful();
         $this->artisan('migrate:rollback', ['--path' => 'database/migrations/2026_11_22_000001_create_payment_reversal_tables.php', '--step' => 1])->assertSuccessful();
         $path = 'database/migrations/2026_11_21_000001_create_premium_tables.php';

@@ -134,7 +134,7 @@ class PaymentReversalTest extends TestCase
     {
         $this->assertSame($messages, collect($this->logged)->pluck('message')->unique()->values()->all());
         foreach ($this->logged as $entry) {
-            $this->assertSame([], array_diff(array_keys($entry), ['level', 'message', 'payment_id', 'kind', 'source', 'status', 'decision', 'closed', 'user_id']));
+            $this->assertSame([], array_diff(array_keys($entry), ['level', 'message', 'payment_id', 'kind', 'source', 'status', 'decision', 'closed', 'user_id', 'gross', 'refunded', 'excess', 'alert']));
         }
         $text = json_encode($this->logged->getArrayCopy());
         foreach (array_keys($this->gateway) as $order) {

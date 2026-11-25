@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Support\PaymentAlert;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -216,11 +217,112 @@ class PaymentAdjustmentService
             ->where(['payment_id' => $paymentId, 'source' => 'midtrans', 'status' => 'pending_review'])->whereIn('reference', $references)->exists();
     }
 
-    /** Sum of refunds sent through payments:gateway-refund that Midtrans has listed in refunds[]. */
-    public function gatewayRefunded(int $paymentId): int
+    /**
+     * The single refund ledger used for every refund limit (gateway and manual) and for excess detection.
+     *
+     * Midtrans-side refunds are counted once per refund_key: an amount listed in refunds[] (when the caller
+     * passes the current Get Status), else the recorded Midtrans adjustment, else the gateway refund row.
+     * Gateway refunds that Midtrans does not list (pending, submitted, unknown, closed_unprocessed) are
+     * "reserved": releasing a refund slot never releases its reserved amount. "actual" is money that is
+     * known to have moved (Midtrans + manual); "total" adds the reservations.
+     *
+     * @param  array<string, int>|null  $listed  refund_key => individual refunds[] amount from Get Status
+     */
+    public function refundExposure(object $payment, ?array $listed = null, ?string $exclude = null, bool $dedupeReferences = false): array
     {
-        return Schema::hasTable('payment_gateway_refunds') ? (int) DB::table('payment_gateway_refunds')
-            ->where('payment_id', $paymentId)->whereIn('status', ['succeeded', 'confirmed'])->sum('amount') : 0;
+        $keyed = [];
+        $cumulative = 0;
+        $full = false;
+        $manual = [];
+        foreach (DB::table('payment_adjustments')->where('payment_id', $payment->id)->whereIn('source', ['manual', 'midtrans'])->get(['source', 'kind', 'reference', 'amount']) as $row) {
+            if ($row->source === 'manual') {
+                $manual['partial_refund:key:'.hash('sha256', $row->reference)] = ($manual['partial_refund:key:'.hash('sha256', $row->reference)] ?? 0) + (int) $row->amount;
+            } elseif ($row->kind === 'refund') {
+                $full = true;
+            } elseif ($row->kind === 'partial_refund' && str_starts_with($row->reference, 'partial_refund:key:')) {
+                $keyed[$row->reference] = max($keyed[$row->reference] ?? 0, (int) $row->amount);
+            } elseif ($row->kind === 'partial_refund') {
+                // Legacy amount-based references and the cumulative fallback are snapshots of the gateway total.
+                $cumulative = max($cumulative, (int) $row->amount);
+            }
+        }
+        foreach ($listed ?? [] as $key => $amount) {
+            $keyed['partial_refund:key:'.hash('sha256', (string) $key)] = (int) $amount;
+        }
+        $reserved = 0;
+        if (Schema::hasTable('payment_gateway_refunds')) {
+            foreach (DB::table('payment_gateway_refunds')->where('payment_id', $payment->id)->where('status', '!=', 'rejected')->get(['refund_key', 'amount', 'status']) as $intent) {
+                $reference = 'partial_refund:key:'.hash('sha256', $intent->refund_key);
+                if ($intent->refund_key === $exclude || isset($keyed[$reference])) {
+                    continue;
+                }
+                if (in_array($intent->status, ['succeeded', 'confirmed', 'review'], true)) {
+                    // Listed by Midtrans earlier even if no adjustment could be recorded (e.g. HTTP 422).
+                    $keyed[$reference] = (int) $intent->amount;
+                } else {
+                    $reserved += (int) $intent->amount;
+                }
+            }
+        }
+        $gross = (int) $payment->amount;
+        $midtrans = max(array_sum($keyed), $cumulative, $full ? $gross : 0);
+        $manual = array_sum($dedupeReferences ? array_diff_key($manual, $keyed) : $manual);
+        $actual = $midtrans + $manual;
+
+        return ['manual' => $manual, 'midtrans' => $midtrans, 'reserved' => $reserved, 'actual' => $actual,
+            'total' => $actual + $reserved, 'remaining' => $gross - $actual - $reserved, 'excess' => max(0, $actual - $gross)];
+    }
+
+    /**
+     * Records (once per refunded total) and alerts when money known to have been refunded exceeds the
+     * payment. History is never removed or rejected; the anomaly blocks further refunds for the payment.
+     *
+     * @param  array<string, int>|null  $listed
+     */
+    public function flagRefundExcess(object $payment, ?array $listed = null, string $source = 'midtrans'): bool
+    {
+        if (! Schema::hasTable('payment_refund_anomalies')) {
+            return false;
+        }
+        // A manual reference equal to a Midtrans refund_key is a possible double record of one transfer
+        // (payment.refund_reference_conflict): limits count both, excess detection counts it once.
+        $exposure = $this->refundExposure($payment, $listed, null, true);
+        if ($exposure['excess'] === 0) {
+            return false;
+        }
+        $evidence = ['source' => $source, 'manual' => $exposure['manual'], 'midtrans' => $exposure['midtrans'], 'reserved' => $exposure['reserved'],
+            'listed' => collect($listed ?? [])->mapWithKeys(fn ($amount, $key) => [hash('sha256', (string) $key) => (int) $amount])->all(),
+            'manual_references' => DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'manual'])->count()];
+        $inserted = DB::table('payment_refund_anomalies')->insertOrIgnore([
+            'payment_id' => $payment->id, 'kind' => 'refund_excess', 'gross_amount' => (int) $payment->amount, 'refunded_amount' => $exposure['actual'],
+            'excess_amount' => $exposure['excess'], 'evidence' => json_encode($evidence), 'created_at' => now(),
+        ]);
+        if ($inserted) {
+            PaymentAlert::raise('payment.refund_excess', ['payment_id' => $payment->id, 'gross' => (int) $payment->amount,
+                'refunded' => $exposure['actual'], 'excess' => $exposure['excess'], 'source' => $source]);
+        }
+
+        return $inserted > 0;
+    }
+
+    /** @return array<string, int> refund_key => individual amount from Get Status refunds[] */
+    public function listedRefunds(array $current): array
+    {
+        $listed = [];
+        foreach (is_array($current['refunds'] ?? null) ? $current['refunds'] : [] as $refund) {
+            $key = is_array($refund) ? ($refund['refund_key'] ?? null) : null;
+            $value = is_array($refund) ? ($refund['refund_amount'] ?? null) : null;
+            if (is_string($key) && (is_string($value) || is_int($value)) && preg_match('/\A[0-9]{1,9}(?:\.00)?\z/', (string) $value)) {
+                $listed[$key] = (int) $value;
+            }
+        }
+
+        return $listed;
+    }
+
+    public function refundAnomalyOpen(int $paymentId): bool
+    {
+        return Schema::hasTable('payment_refund_anomalies') && DB::table('payment_refund_anomalies')->where('payment_id', $paymentId)->exists();
     }
 
     private function gatewayRefundOpen(int $paymentId): bool
@@ -380,15 +482,21 @@ class PaymentAdjustmentService
         if ($payment->status !== 'paid') {
             return [false, 'Hanya pembayaran berstatus paid yang dapat dicatat refund manualnya.'];
         }
+        if ($this->refundAnomalyOpen($payment->id)) {
+            return [false, 'Pembayaran ini memiliki anomali kelebihan refund (refund_excess). Refund baru diblokir sampai ditinjau. Tidak ada yang dicatat.'];
+        }
         if ($this->gatewayRefundOpen($payment->id)) {
             return [false, 'Ada refund Midtrans (payments:gateway-refund) yang hasilnya belum pasti. Jalankan payments:gateway-refund --reconcile terlebih dahulu. Tidak ada yang dicatat.'];
         }
-        $totals = $this->refundTotal($payment->id);
-        $left = (int) $payment->amount - $totals['manual'] - max($totals['midtrans'], $this->gatewayRefunded($payment->id));
+        // Same ledger as payments:gateway-refund, including amounts reserved by closed gateway refunds.
+        $exposure = $this->refundExposure($payment);
+        $left = $exposure['remaining'];
         if ($amount > $left) {
-            return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.').'.'];
+            return [false, 'Total refund melebihi nominal pembayaran. Sisa yang dapat direfund: Rp'.number_format(max(0, $left), 0, ',', '.')
+                .($exposure['reserved'] > 0 ? ' (Rp'.number_format($exposure['reserved'], 0, ',', '.').' dicadangkan untuk refund Midtrans yang belum pasti atau ditutup administratif).' : '.')];
         }
-        $full = $amount === $left;
+        // While gateway refunds are reserved the payment is never treated as fully refunded.
+        $full = $amount === $left && $exposure['reserved'] === 0;
         $plan = $full ? 'refund penuh: pembayaran menjadi refunded dan sisa Premium dari pembayaran ini dicabut'
             : 'refund sebagian: dicatat untuk ditinjau, masa aktif Premium tidak diubah';
         if (! $confirm) {

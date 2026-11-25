@@ -225,7 +225,17 @@ php artisan payments:gateway-refund 123 --amount=2000 --reason="Customer refund"
 php artisan payments:gateway-refund 123 --amount=2000 --reason="Customer refund" --confirm --refund-key=dr-refund-unique-001 --confirm-production=<order_id>
 # Rekonsiliasi refund yang belum selesai (hanya Get Status, tidak mengirim ulang)
 php artisan payments:gateway-refund 123 --reconcile
+# Reattempt eksplisit refund pending/unknown dengan refund_key, nominal dan alasan yang sama (≤144 jam)
+php artisan payments:gateway-refund 123 --reattempt --refund-key=dr-refund-unique-001 --confirm
+# Penutupan refund unknown setelah konfirmasi tertulis Midtrans (hanya pengembangan; ditolak di Production)
+php artisan payments:gateway-refund-close-request <id-refund> --ticket=<tiket> --confirmed-on=YYYY-MM-DD --order-id=<order_id> --refund-key=<key> --amount=<nominal> --midtrans-confirmed-not-processed --reason="..." --confirm
+php artisan payments:gateway-refund-close-approve <id-permintaan> --ticket=<tiket> --confirm
+# Daftar dan rekonsiliasi semua refund gateway (juga dijadwalkan tiap 15 menit, hanya Get Status)
+php artisan payments:gateway-refunds --status=unknown
+php artisan payments:gateway-refunds --reconcile
 ```
+
+Prosedur operator lengkap (refund unknown, reattempt, rekonsiliasi, backup/restore SQLite, trusted proxy, webhook, emergency rollback) ada di [operasional-pembayaran.md](operasional-pembayaran.md).
 
 Operator dicatat dari `--operator` (default: user sistem). Validasi sebelum mengirim: pembayaran lokal `paid`; Get Status `settlement`/`partial_refund` dengan fraud `accept`; `payment_type` termasuk metode Refund API (`credit_card`, `gopay`, `shopeepay`, `dana`, `ovo`, `qris`, `kredivo`, `akulaku`; ShopeePay/OVO hanya refund penuh); `refund_amount` kumulatif sama dengan jumlah `refunds[]`; dan nominal ≤ sisa = pembayaran − refund Midtrans − refund manual. Metode lain (mis. Virtual Account) tetap memakai `payments:refund`.
 
@@ -247,10 +257,11 @@ Alur dua fase:
 | `succeeded` | Ada di `refunds[]`, `bank_confirmed_at` belum ada; dana **belum tentu** diterima pelanggan | Dibuka |
 | `confirmed` | `bank_confirmed_at` terisi | Dibuka |
 | `rejected` | Penolakan definitif (400–404, 410–414) dan tidak ada di `refunds[]` | Dibuka |
+| `closed_unprocessed` | Ditutup dua operator (hanya pengembangan) setelah Midtrans mengonfirmasi tertulis tidak diproses | Dibuka; nominal tetap dicadangkan |
 
 **Idempotency.** `refund_key` unik global (unique index) dan tidak pernah dipakai ulang; kolom `active_slot` (unique, berisi `payment_id` selama request belum selesai) menjamin maksimal satu refund berjalan per pembayaran, termasuk saat dua operator menjalankan perintah bersamaan. `refund_key` yang sama dengan referensi refund manual atau refund Midtrans yang sudah tercatat ditolak. HTTP 200 tidak dianggap dana sudah diterima; hanya `bank_confirmed_at` yang menandai konfirmasi bank.
 
-**Timeout dan rekonsiliasi.** Timeout menghasilkan `unknown`. Jangan membuat `refund_key` baru dan jangan mengirim ulang; jalankan `--reconcile` sampai statusnya jelas. Midtrans mengizinkan reattempt dengan `refund_key` yang sama maksimal 7 hari, tetapi aplikasi sengaja tidak melakukannya otomatis. Tidak munculnya refund di Get Status, berapa pun lamanya, tidak membuktikan request tidak akan diproses, sehingga aplikasi **tidak menyediakan** cara melepas slot refund `pending`/`submitted`/`unknown`/`review`. Selama slot ditahan, refund gateway baru dan pencatatan manual `payments:refund` untuk pembayaran itu ditolak. Jika Midtrans (Dashboard atau support) memastikan request tidak akan pernah diproses, penyelesaiannya merupakan intervensi operator di database dengan backup dan catatan audit, di luar aplikasi.
+**Timeout dan rekonsiliasi.** Timeout menghasilkan `unknown`; aplikasi tidak pernah mengirim ulang otomatis dan tidak pernah menganggap hasil ambigu sebagai gagal. Rekonsiliasi (`--reconcile` per pembayaran, atau `payments:gateway-refunds --reconcile` yang dijadwalkan tiap 15 menit) hanya memanggil Get Status. Pembaruan status memakai compare-and-set, sehingga snapshot lama atau dua proses bersamaan tidak dapat memundurkan refund yang sudah tampil di Midtrans atau melepas slot. Bila refund tetap tidak tampil, operator dapat melakukan reattempt eksplisit dengan `refund_key`, nominal dan alasan yang sama. Midtrans memperlakukan `refund_key` yang sama sebagai pengulangan refund yang sama dan mengizinkannya maksimal 7 hari; aplikasi membatasi 144 jam sejak intent dibuat dengan jeda minimal 10 menit. Penolakan pada reattempt tidak mengubah status menjadi `rejected`. Selama slot ditahan, refund gateway baru dan pencatatan manual `payments:refund` untuk pembayaran itu ditolak. Setelah batas reattempt lewat, refund tetap terbuka sampai Midtrans memberi konfirmasi tertulis. Penutupan `closed_unprocessed` lewat dua akun sistem operasi (`payments:gateway-refund-close-request` lalu `payments:gateway-refund-close-approve`) hanya tersedia di lingkungan pengembangan dan **ditolak di Production**, karena dua UID tidak membuktikan dua orang (sudo/su/root) dan akses tulis SQLite dapat melewatinya. Nominal refund tertutup tetap dicadangkan dalam batas refund; bila Midtrans mencantumkannya kemudian, refund tercatat ulang dan alert dibuat. Kelebihan refund dicatat di `payment_refund_anomalies` dan memblokir refund berikutnya. Lihat runbook bagian 4A–4D.
 
 **Refund manual.** `payments:refund` tetap hanya mencatat transfer di luar Midtrans. Pencatatan ditolak selama ada refund gateway yang belum pasti, dan sisa yang dapat dicatat dihitung dari refund manual ditambah nilai terbesar antara refund Midtrans di `payment_adjustments` dan refund gateway `succeeded`/`confirmed`. Sebelum migration `payment_gateway_refunds` dijalankan, perintah ini tetap bekerja seperti sebelumnya.
 
@@ -258,15 +269,15 @@ Migration `2026_11_25_000001_create_payment_gateway_refunds_table.php` sudah dis
 
 ### Webhook Production
 
-`POST /api/midtrans/notification` selalu terdaftar (aman untuk `route:cache`) dan mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Signature SHA-512 atas `order_id + status_code + gross_amount + Signature Secret Key` environment aktif dibandingkan dengan `hash_equals`. Payload notifikasi tidak dipercaya sebagai status: status selalu diambil ulang dari Get Status. Endpoint tidak memakai CSRF/sesi dan tidak mencatat signature atau credential. Rate limiter khusus `midtrans-webhook` (120 request/menit per IP, key terpisah dari checkout) mengembalikan 429; Midtrans mengirim ulang notifikasi yang tidak dijawab 2xx. Di balik proxy/CDN, konfigurasikan trusted proxies agar IP asli terbaca; tanpa itu semua notifikasi berbagi satu kuota. Webhook asli Midtrans belum pernah diterima karena belum ada endpoint publik yang disetujui.
+`POST /api/midtrans/notification` selalu terdaftar (aman untuk `route:cache`) dan mengembalikan 404 sampai `MIDTRANS_WEBHOOK_ENABLED=true`. Signature SHA-512 atas `order_id + status_code + gross_amount + Signature Secret Key` environment aktif dibandingkan dengan `hash_equals`. Payload notifikasi tidak dipercaya sebagai status: status selalu diambil ulang dari Get Status. Saat nonaktif, endpoint mengembalikan 404 sebelum validasi payload, sehingga request tidak valid tidak mengungkap keberadaannya lewat 422. Endpoint tidak memakai CSRF/sesi dan tidak mencatat signature atau credential. Rate limiter khusus `midtrans-webhook` (`MIDTRANS_WEBHOOK_RATE_LIMIT`, bawaan 120 request/menit per IP, key terpisah dari checkout) mengembalikan 429; Midtrans mengirim ulang notifikasi yang tidak dijawab 2xx. Di balik proxy, isi `TRUSTED_PROXIES` dengan IP/CIDR proxy yang sebenarnya (wildcard ditolak) agar IP asli dan HTTPS terdeteksi; lihat runbook. Webhook asli Midtrans belum pernah diterima karena belum ada endpoint publik yang disetujui.
 
 ### Prosedur aktivasi Production
 
-1. Backup database target; jalankan migration yang tertunda (termasuk `payment_gateway_refunds`) dengan `php artisan migrate --force` pada target yang benar.
+1. Backup database target dengan `sqlite3 .backup` (bukan `cp`) dan verifikasi; jalankan migration yang tertunda (termasuk `payment_gateway_refunds`) dengan `php artisan migrate --force` pada `/var/lib/dapur-rantau/database.sqlite`. Atur `DB_JOURNAL_MODE=wal`, `DB_SYNCHRONOUS=normal`, `DB_BUSY_TIMEOUT=5000`, dan `TRUSTED_PROXIES` sesuai infrastruktur.
 2. Di Dashboard Midtrans **Production**: salin Server Key, Client Key dan Signature Secret Key ke `MIDTRANS_PRODUCTION_*` di `.env` server (bukan Git). Pastikan permission Server Key: Snap Write, Core API Read, dan Write untuk refund.
 3. Set `MIDTRANS_ENVIRONMENT=production`, `APP_ENV=production`, `APP_DEBUG=false`; biarkan `MIDTRANS_WEBHOOK_ENABLED=false` dulu. Jalankan `php artisan config:cache`.
 4. Atur Payment Notification URL Production ke `https://<domain>/api/midtrans/notification`, lalu set `MIDTRANS_WEBHOOK_ENABLED=true` dan `config:cache` ulang.
-5. Jadwalkan `php artisan schedule:run` (rekonsiliasi tiap 5 menit).
+5. Jadwalkan `php artisan schedule:run` (rekonsiliasi pembayaran tiap 5 menit dan refund gateway tiap 15 menit, keduanya hanya Get Status).
 6. Uji refund pertama dengan dry-run, lalu satu refund kecil yang disetujui dengan `--confirm-production`, dan pantau `--reconcile` sampai `confirmed`.
 
 Perilaku Production (mis. `refund_method` online/offline, waktu `bank_confirmed_at`) belum diverifikasi; fakta Sandbox (`refund_method=offline`, `bank_confirmed_at` langsung terisi) tidak boleh diasumsikan sama.

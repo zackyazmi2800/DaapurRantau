@@ -39,9 +39,10 @@ return [
             'prefix' => '',
             'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
             // Bound lock waiting for quota, database cache/rate limiter and sessions.
-            'busy_timeout' => 1000,
-            'journal_mode' => null,
-            'synchronous' => null,
+            // Values are interpolated into PRAGMA statements, so only known values pass.
+            'busy_timeout' => max(100, min(30000, (int) env('DB_BUSY_TIMEOUT', 1000))),
+            'journal_mode' => in_array($journal = strtolower((string) env('DB_JOURNAL_MODE')), ['wal', 'delete'], true) ? $journal : null,
+            'synchronous' => in_array($synchronous = strtolower((string) env('DB_SYNCHRONOUS')), ['normal', 'full'], true) ? $synchronous : null,
             'transaction_mode' => 'DEFERRED',
         ],
 

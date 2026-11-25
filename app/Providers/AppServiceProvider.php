@@ -5,6 +5,7 @@ namespace App\Providers;
 use App\Exceptions\RecipeGenerationException;
 use App\Support\RecipeFailureResponse;
 use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Middleware\TrustProxies;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
@@ -39,7 +40,10 @@ class AppServiceProvider extends ServiceProvider
         RateLimiter::for('auth-reset', fn (Request $request) => $authLimit(3, 'reset:'.hash('sha256', $request->ip())));
 
         // Dedicated key space: never shared with checkout or other numeric throttles.
-        RateLimiter::for('midtrans-webhook', fn (Request $request) => Limit::perMinute(120)->by('midtrans-webhook:'.hash('sha256', (string) $request->ip())));
+        RateLimiter::for('midtrans-webhook', fn (Request $request) => Limit::perMinute((int) config('midtrans.webhook_rate_limit', 120))
+            ->by('midtrans-webhook:'.hash('sha256', (string) $request->ip())));
+        TrustProxies::withHeaders(config('trustedproxy.headers') === 'forwarded' ? Request::HEADER_FORWARDED
+            : Request::HEADER_X_FORWARDED_FOR | Request::HEADER_X_FORWARDED_HOST | Request::HEADER_X_FORWARDED_PORT | Request::HEADER_X_FORWARDED_PROTO);
 
         RateLimiter::for('recipes', fn (Request $request) => Limit::perMinute(5)
             ->by(hash('sha256', $request->ip()))

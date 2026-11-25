@@ -2,10 +2,23 @@
 
 namespace App\Http\Requests;
 
+use App\Services\MidtransSandboxService;
 use Illuminate\Foundation\Http\FormRequest;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 class MidtransNotificationRequest extends FormRequest
 {
+    // Runs before validation, so a disabled endpoint never reveals itself with a 422.
+    public function authorize(MidtransSandboxService $gateway): bool
+    {
+        return $gateway->webhookEnabled();
+    }
+
+    protected function failedAuthorization(): void
+    {
+        throw new NotFoundHttpException;
+    }
+
     public function rules(): array
     {
         return [

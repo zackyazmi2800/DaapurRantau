@@ -157,6 +157,9 @@ class MidtransSandboxService
 
         try {
             $refunded ? $this->adjustments->recordMidtransPartialRefund($payment, $current) : $this->settle($payment, $current);
+            if ($refunded) {
+                $this->adjustments->flagRefundExcess(DB::table('payments')->where('id', $payment->id)->first(), $this->adjustments->listedRefunds($current), 'webhook');
+            }
         } catch (Throwable $exception) {
             if ($exception instanceof HttpException || SqliteContention::isBusy($exception)) {
                 throw $exception;
@@ -320,6 +323,7 @@ class MidtransSandboxService
         $outcome = $adjustment[0] === 'partial_refund'
             ? $this->adjustments->recordMidtransPartialRefund($payment, $current)
             : $this->adjustments->record($payment, ...$adjustment);
+        $this->adjustments->flagRefundExcess(DB::table('payments')->where('id', $payment->id)->first(), $this->adjustments->listedRefunds($current));
 
         return $outcome === 'unchanged' ? null : $outcome;
     }
@@ -332,6 +336,8 @@ class MidtransSandboxService
             in_array($status, ['refund', 'chargeback'], true) => $status,
             $settled && in_array($status, ['partial_refund', 'partial_chargeback'], true) => $status,
             $payment->status === 'pending' && $status === 'partial_refund' => $status,
+            // A refund Midtrans lists after the payment was fully refunded must still reach the ledger.
+            $payment->status === 'refunded' && $status === 'partial_refund' => $status,
             $settled && in_array($status, ['deny', 'cancel', 'expire', 'failure'], true) => 'reversal',
             default => null,
         };

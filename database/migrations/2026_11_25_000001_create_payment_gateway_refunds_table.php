@@ -27,6 +27,9 @@ return new class extends Migration
             $table->string('provider_status_code', 3)->nullable();
             $table->string('gateway_created_at', 32)->nullable();
             $table->string('bank_confirmed_at', 32)->nullable();
+            // Explicit operator reattempts reuse the same refund_key (Midtrans: within 7 days).
+            $table->unsignedSmallInteger('attempts')->default(0);
+            $table->dateTime('last_attempt_at')->nullable();
             $table->dateTime('submitted_at')->nullable();
             $table->dateTime('verified_at')->nullable();
             $table->dateTime('last_checked_at')->nullable();

@@ -2,15 +2,24 @@
 
 namespace Tests\Feature;
 
+use App\Mail\PaymentAlertMail;
 use App\Models\User;
+use App\Services\GatewayRefundService;
 use App\Services\MidtransSandboxService;
 use App\Services\SubscriptionService;
+use App\Support\OperatorIdentity;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Http\Client\Request;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
 
 class GatewayRefundTest extends TestCase
@@ -21,6 +30,14 @@ class GatewayRefundTest extends TestCase
     private string $mode = 'accept';
 
     private int $posts = 0;
+
+    private int $gets = 0;
+
+    /** @var list<array> Refund API request bodies */
+    private array $bodies = [];
+
+    /** Runs once inside the next Get Status, to simulate a concurrent process. */
+    private ?\Closure $during = null;
 
     private string $api = 'https://api.sandbox.midtrans.com';
 
@@ -38,9 +55,17 @@ class GatewayRefundTest extends TestCase
             $order = explode('/', $request->url())[4];
             $this->assertStringStartsWith($this->api.'/v2/', $request->url());
             if ($request->method() === 'GET') {
-                return Http::response($this->status[$order]);
+                $this->gets++;
+                $state = $this->status[$order];
+                if ($hook = $this->during) {
+                    $this->during = null;
+                    $hook();
+                }
+
+                return Http::response($state);
             }
             $this->posts++;
+            $this->bodies[] = $request->data();
             $this->assertSame("{$this->api}/v2/{$order}/refund", $request->url());
             if ($this->mode === 'reject') {
                 return Http::response(['status_code' => '412', 'status_message' => 'Merchant cannot modify the status of the transaction']);
@@ -132,7 +157,7 @@ class GatewayRefundTest extends TestCase
 
         $other = $this->paid();
         $this->mode = 'timeout';
-        $this->refund($other, ['--confirm' => true, '--refund-key' => 'dr-refund-lost-01'])->expectsOutputToContain('Jangan kirim ulang')->assertFailed();
+        $this->refund($other, ['--confirm' => true, '--refund-key' => 'dr-refund-lost-01'])->expectsOutputToContain('Jangan membuat refund_key baru')->assertFailed();
         $this->refund($other, ['--reconcile' => true])->expectsOutputToContain('unknown -> unknown')->assertSuccessful();
         $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-lost-01', 'status' => 'unknown', 'active_slot' => $other->id]);
         $this->refund($other, ['--confirm' => true, '--refund-key' => 'dr-refund-new-01'])->expectsOutputToContain('belum selesai')->assertFailed();
@@ -172,7 +197,7 @@ class GatewayRefundTest extends TestCase
     {
         $payment = $this->paid();
         for ($i = 0; $i < 120; $i++) {
-            $this->postJson('/api/midtrans/notification', ['order_id' => $payment->order_id])->assertUnprocessable();
+            $this->postJson('/api/midtrans/notification', ['order_id' => $payment->order_id])->assertNotFound();
         }
         $this->postJson('/api/midtrans/notification', ['order_id' => $payment->order_id])->assertTooManyRequests();
         $this->actingAs(User::factory()->create())->postJson('/langganan/checkout', ['plan' => 'invalid'])->assertUnprocessable();
@@ -234,5 +259,447 @@ class GatewayRefundTest extends TestCase
         config(['midtrans.environment' => 'production', 'midtrans.production.signature_secret_key' => 'prod-signature']);
         $this->postJson('/api/midtrans/notification', $sign('fixture-signature'))->assertForbidden();
         Http::assertSentCount(1);
+    }
+
+    public function test_unknown_refund_is_reattempted_only_with_the_same_key_amount_and_reason(): void
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-retry-01'])->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-retry-01', 'status' => 'unknown', 'attempts' => 1]);
+        $reattempt = fn (array $options = []) => $this->artisan('payments:gateway-refund', $options + ['payment' => $payment->id, '--reattempt' => true,
+            '--refund-key' => 'dr-refund-retry-01', '--operator' => 'ops-test']);
+
+        $reattempt(['--confirm' => true])->expectsOutputToContain('kurang dari 10 menit')->assertFailed();
+        $this->travel(11)->minutes();
+        $reattempt()->expectsOutputToContain('percobaan ke-2')->assertSuccessful();
+        $this->assertSame(1, $this->posts);
+
+        // A definitive rejection of a reattempt says nothing about the first attempt.
+        $this->mode = 'reject';
+        $reattempt(['--confirm' => true])->expectsOutputToContain('Jangan membuat refund_key baru')->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-retry-01', 'status' => 'unknown', 'attempts' => 2,
+            'active_slot' => $payment->id, 'provider_status_code' => '412']);
+
+        $this->travel(11)->minutes();
+        $this->mode = 'accept';
+        $reattempt(['--confirm' => true])->expectsOutputToContain('tercatat di refunds[]')->assertSuccessful();
+        $this->assertSame(3, $this->posts);
+        $this->assertSame(array_fill(0, 3, ['refund_key' => 'dr-refund-retry-01', 'amount' => 2000, 'reason' => 'Customer refund']), $this->bodies);
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-retry-01', 'status' => 'succeeded', 'attempts' => 3, 'active_slot' => null]);
+        $this->assertSame(1, DB::table('payment_gateway_refunds')->count());
+        $this->assertSame(1, DB::table('payment_adjustments')->where('payment_id', $payment->id)->count());
+        $reattempt(['--confirm' => true])->expectsOutputToContain('tidak perlu diulang')->assertFailed();
+        $this->assertSame(3, $this->posts);
+    }
+
+    public function test_reattempt_resolves_listed_refunds_without_posting_and_stops_after_the_window(): void
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-late-01'])->assertFailed();
+        $this->record($payment->order_id, 'dr-refund-late-01', 2000, 'Customer refund');
+        $this->travel(11)->minutes();
+        $this->artisan('payments:gateway-refund', ['payment' => $payment->id, '--reattempt' => true, '--refund-key' => 'dr-refund-late-01', '--confirm' => true])
+            ->expectsOutputToContain('sudah tercatat di Midtrans')->assertSuccessful();
+        $this->assertSame(1, $this->posts);
+
+        $other = $this->paid();
+        $this->refund($other, ['--confirm' => true, '--refund-key' => 'dr-refund-late-02'])->assertFailed();
+        $this->travel(144)->hours();
+        $this->artisan('payments:gateway-refund', ['payment' => $other->id, '--reattempt' => true, '--refund-key' => 'dr-refund-late-02', '--confirm' => true])
+            ->expectsOutputToContain('prosedur konfirmasi Midtrans')->assertFailed();
+        $this->assertSame(2, $this->posts);
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-late-02', 'status' => 'unknown', 'active_slot' => $other->id]);
+
+        config(['midtrans.environment' => 'production', 'midtrans.production.server_key' => 'Mid-server-fixture']);
+        $this->artisan('payments:gateway-refund', ['payment' => $other->id, '--reattempt' => true, '--refund-key' => 'dr-refund-late-02', '--confirm' => true])
+            ->expectsOutputToContain('Environment Midtrans aktif tidak sesuai')->assertFailed();
+        $this->assertSame(2, $this->posts);
+    }
+
+    public function test_listing_and_scheduled_reconciliation_only_read_midtrans(): void
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-list-01'])->assertFailed();
+        $listed = $this->paid();
+        $this->mode = 'accept';
+        $this->refund($listed, ['--confirm' => true, '--refund-key' => 'dr-refund-list-02'])->assertSuccessful();
+
+        $this->artisan('payments:gateway-refunds')->expectsOutputToContain('dr-refund-list-01')->assertSuccessful();
+        $this->artisan('payments:gateway-refunds', ['--status' => 'confirmed'])->expectsOutputToContain('Tidak ada refund Midtrans')->assertSuccessful();
+        $this->artisan('payments:gateway-refunds', ['--status' => 'bogus'])->expectsOutputToContain('Status tidak dikenal')->assertFailed();
+
+        $this->record($payment->order_id, 'dr-refund-list-01', 2000, 'Customer refund');
+        $this->status[$listed->order_id]['refunds'][0]['bank_confirmed_at'] = '2026-01-02 08:00:00';
+        $posts = $this->posts;
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->expectsOutputToContain('confirmed=1')->assertSuccessful();
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->expectsOutputToContain('unchanged=1')->assertSuccessful();
+        $this->assertSame($posts, $this->posts);
+        $this->assertSame(['succeeded', 'confirmed'], DB::table('payment_gateway_refunds')->orderBy('id')->pluck('status')->all());
+        $this->assertSame(2, DB::table('payment_adjustments')->where('kind', 'partial_refund')->count());
+
+        $events = collect(app(Schedule::class)->events())->map(fn ($event) => $event->command);
+        $this->assertTrue($events->contains(fn ($command) => str_contains((string) $command, 'payments:gateway-refunds --reconcile')));
+    }
+
+    public function test_concurrent_reconciliation_never_moves_a_listed_refund_back(): void
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-race-01'])->assertFailed();
+        $order = $payment->order_id;
+
+        // Process A reads "unknown" and a stale Get Status; meanwhile process B verifies the listed refund.
+        $this->during = function () use ($payment, $order) {
+            $state = $this->status[$order];
+            $this->record($order, 'dr-refund-race-01', 2000, 'Customer refund');
+            $this->assertStringContainsString('unknown -> succeeded', app(GatewayRefundService::class)->reconcile($payment->id)[1]);
+            $this->status[$order] = $state;
+        };
+        $this->refund($payment, ['--reconcile' => true])->expectsOutputToContain('unknown -> succeeded')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-race-01', 'status' => 'succeeded', 'active_slot' => null]);
+
+        // A stale snapshot without bank_confirmed_at never downgrades a confirmed refund.
+        $this->record($order, 'dr-refund-race-01', 2000, 'Customer refund');
+        $this->status[$order]['refunds'] = [$this->status[$order]['refunds'][0] + ['bank_confirmed_at' => '2026-01-02 08:00:00']];
+        $this->status[$order]['refund_amount'] = '2000.00';
+        $this->refund($payment, ['--reconcile' => true])->expectsOutputToContain('succeeded -> confirmed')->assertSuccessful();
+        $this->status[$order]['refunds'][0] = array_diff_key($this->status[$order]['refunds'][0], ['bank_confirmed_at' => 1]);
+        $this->assertSame([true, 'Tidak ada refund Midtrans yang perlu direkonsiliasi untuk pembayaran ini.'], app(GatewayRefundService::class)->reconcile($payment->id));
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-race-01', 'status' => 'confirmed', 'bank_confirmed_at' => '2026-01-02 08:00:00']);
+        $this->assertSame(1, DB::table('payment_adjustments')->where('payment_id', $payment->id)->count());
+    }
+
+    public function test_disabled_webhook_hides_itself_before_validation_and_proxies_must_be_explicit(): void
+    {
+        $this->postJson('/api/midtrans/notification', [])->assertNotFound();
+        $this->postJson('/api/midtrans/notification', ['order_id' => 'x', 'signature_key' => 'y'])->assertNotFound();
+        config(['midtrans.webhook_enabled' => true]);
+        $this->postJson('/api/midtrans/notification', [])->assertUnprocessable();
+
+        $parse = function (string $proxies, string $headers = '') {
+            putenv("TRUSTED_PROXIES={$proxies}");
+            putenv("TRUSTED_PROXY_HEADERS={$headers}");
+            try {
+                return require config_path('trustedproxy.php');
+            } finally {
+                putenv('TRUSTED_PROXIES');
+                putenv('TRUSTED_PROXY_HEADERS');
+            }
+        };
+        $this->assertSame(['proxies' => [], 'headers' => 'x-forwarded'], $parse(''));
+        $this->assertSame(['10.0.0.5', '192.168.0.0/16', '2001:db8::/48'],
+            $parse('*, **, 0.0.0.0/0, ::/0, 10.0.0.5, 192.168.0.0/16, 2001:db8::/48, not-an-ip, 10.0.0.0/40, REMOTE_ADDR')['proxies']);
+        $this->assertSame('forwarded', $parse('', 'Forwarded')['headers']);
+
+        // Untrusted clients cannot pick their own IP (and thus their rate-limit key) or force HTTPS.
+        Route::get('/__proxy-probe', fn (\Illuminate\Http\Request $request) => [$request->ip(), $request->isSecure()]);
+        $route = 'http://localhost/__proxy-probe';
+        $headers = ['X-Forwarded-For' => '203.0.113.9', 'X-Forwarded-Proto' => 'https'];
+        $this->withServerVariables(['REMOTE_ADDR' => '10.0.0.5'])->getJson($route, $headers)->assertExactJson(['10.0.0.5', false]);
+        config(['trustedproxy.proxies' => ['10.0.0.5']]);
+        $this->withServerVariables(['REMOTE_ADDR' => '10.0.0.5'])->getJson($route, $headers)->assertExactJson(['203.0.113.9', true]);
+        $this->withServerVariables(['REMOTE_ADDR' => '10.0.0.6'])->getJson($route, $headers)->assertExactJson(['10.0.0.6', false]);
+    }
+
+    private function operator(?int $uid, string $name = 'ops'): void
+    {
+        $this->app->instance(OperatorIdentity::class, new class($uid, $name) extends OperatorIdentity
+        {
+            public function __construct(private ?int $uid, private string $name) {}
+
+            public function current(): ?array
+            {
+                return $this->uid === null ? null : ['uid' => $this->uid, 'name' => $this->name];
+            }
+        });
+    }
+
+    /** A refund that stayed unknown past the 144 hour reattempt window. */
+    private function expiredUnknown(string $key = 'dr-refund-close-01'): array
+    {
+        $payment = $this->paid();
+        $this->mode = 'timeout';
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => $key])->assertFailed();
+        $this->mode = 'accept';
+
+        return [$payment, DB::table('payment_gateway_refunds')->where('refund_key', $key)->first()];
+    }
+
+    private function closeRequest(object $payment, object $refund, array $options = [])
+    {
+        return $this->artisan('payments:gateway-refund-close-request', $options + ['refund' => $refund->id, '--ticket' => 'MT-CASE-12345',
+            '--confirmed-on' => now('Asia/Jakarta')->toDateString(), '--order-id' => $payment->order_id, '--refund-key' => $refund->refund_key,
+            '--amount' => (string) $refund->amount, '--midtrans-confirmed-not-processed' => true, '--reason' => 'Midtrans menyatakan refund tidak diproses']);
+    }
+
+    public function test_unknown_refund_closure_needs_expiry_complete_evidence_and_an_os_identity(): void
+    {
+        $this->operator(1001, 'alice');
+        [$payment, $refund] = $this->expiredUnknown();
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('Batas reattempt belum lewat')->assertFailed();
+        $this->travel(145)->hours();
+
+        $this->operator(null);
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('tidak dapat dibuktikan')->assertFailed();
+        $this->operator(1001, 'alice');
+        foreach ([
+            ['--ticket' => ''], ['--ticket' => 'x'], ['--confirmed-on' => '2026-13-01'], ['--confirmed-on' => '2030-01-01'], ['--confirmed-on' => '2025-12-31'],
+            ['--midtrans-confirmed-not-processed' => false], ['--order-id' => (string) Str::uuid()], ['--refund-key' => 'dr-refund-other-1'],
+            ['--amount' => '1999'], ['--reason' => 'singkat'],
+        ] as $broken) {
+            $this->closeRequest($payment, $refund, $broken + ['--confirm' => true])->expectsOutputToContain('Tidak ada yang dicatat')->assertFailed();
+        }
+        $this->closeRequest($payment, $refund)->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        $this->assertDatabaseCount('payment_gateway_refund_closures', 0);
+
+        $listed = $this->expiredUnknown('dr-refund-close-02');
+        $this->closeRequest(...$listed)->expectsOutputToContain('Batas reattempt belum lewat')->assertFailed();
+        $this->assertSame(2, $this->posts);
+
+        $done = $this->paid();
+        $this->refund($done, ['--confirm' => true, '--refund-key' => 'dr-refund-close-03'])->assertSuccessful();
+        $this->closeRequest($done, DB::table('payment_gateway_refunds')->where('refund_key', 'dr-refund-close-03')->first())
+            ->expectsOutputToContain('status saat ini succeeded')->assertFailed();
+        $this->assertDatabaseCount('payment_gateway_refund_closures', 0);
+    }
+
+    public function test_two_different_os_accounts_close_an_unknown_refund_atomically_with_an_append_only_trail(): void
+    {
+        [$payment, $refund] = $this->expiredUnknown();
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('Slot refund masih ditahan')->assertSuccessful();
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('menunggu persetujuan')->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'unknown', 'active_slot' => $payment->id]);
+        $request = DB::table('payment_gateway_refund_closures')->first();
+        $approve = fn (array $options = []) => $this->artisan('payments:gateway-refund-close-approve', $options + ['request' => $request->id, '--ticket' => 'MT-CASE-12345']);
+
+        $approve(['--confirm' => true])->expectsOutputToContain('tidak boleh menyetujui permintaannya sendiri')->assertFailed();
+        $this->operator(1001, 'someone-else');
+        $approve(['--confirm' => true])->expectsOutputToContain('tidak boleh menyetujui permintaannya sendiri')->assertFailed();
+        $this->operator(1002, 'bob');
+        $approve(['--ticket' => 'MT-CASE-99999', '--confirm' => true])->expectsOutputToContain('--ticket harus sama')->assertFailed();
+        $approve()->expectsOutputToContain('DRY-RUN')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'unknown', 'active_slot' => $payment->id]);
+
+        $approve(['--confirm' => true])->expectsOutputToContain('ditutup sebagai closed_unprocessed')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'closed_unprocessed', 'active_slot' => null,
+            'amount' => 2000, 'refund_key' => 'dr-refund-close-01']);
+        $rows = DB::table('payment_gateway_refund_closures')->orderBy('id')->get();
+        $this->assertSame([['request', null, 1001, 'alice', null], ['approval', $request->id, 1002, 'bob', now()->toDateTimeString()]],
+            $rows->map(fn ($row) => [$row->kind, $row->request_id, (int) $row->operator_uid, $row->operator_name, $row->closed_at])->all());
+        $this->assertSame([$payment->order_id, 'dr-refund-close-01', 2000, 'MT-CASE-12345'], [$rows[1]->order_id, $rows[1]->refund_key, (int) $rows[1]->amount, $rows[1]->midtrans_ticket]);
+        $approve(['--confirm' => true])->expectsOutputToContain('sudah disetujui')->assertFailed();
+        $this->assertSame(1, $this->posts);
+
+        // The slot is free again and a new refund needs a new key, but the closed amount stays reserved.
+        $this->refund($payment, ['--amount' => '5000'])->expectsOutputToContain('Rp2.000 dicadangkan')->assertFailed();
+        $this->refund($payment, ['--amount' => '3000'])->expectsOutputToContain('dicadangkan Rp2.000, sisa Rp3.000')->assertSuccessful();
+        $this->refund($payment, ['--confirm' => true, '--refund-key' => 'dr-refund-close-01'])->expectsOutputToContain('sudah tercatat')->assertFailed();
+        $this->artisan('payments:gateway-refunds', ['--status' => 'closed_unprocessed'])->expectsOutputToContain('dr-refund-close-01')->assertSuccessful();
+
+        foreach ([
+            fn () => DB::table('payment_gateway_refund_closures')->where('id', $request->id)->update(['midtrans_ticket' => 'forged']),
+            fn () => DB::table('payment_gateway_refund_closures')->delete(),
+            fn () => DB::table('payment_gateway_refunds')->where('id', $refund->id)->update(['amount' => 1]),
+            fn () => DB::table('payment_gateway_refunds')->where('id', $refund->id)->delete(),
+            fn () => DB::table('payment_gateway_refunds')->where('id', $refund->id)->update(['status' => 'unknown']),
+        ] as $tamper) {
+            try {
+                $tamper();
+                $this->fail('Tampering should be rejected.');
+            } catch (QueryException $exception) {
+                $this->assertMatchesRegularExpression('/append-only|immutable|listed by Midtrans/', $exception->getMessage());
+            }
+        }
+
+        // If Midtrans lists the closed refund after all, reconciliation surfaces it.
+        $this->record($payment->order_id, 'dr-refund-close-01', 2000, 'Customer refund');
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->expectsOutputToContain('succeeded=1')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'succeeded', 'active_slot' => null]);
+        $this->assertSame(1, $this->posts);
+    }
+
+    public function test_closure_is_refused_when_midtrans_lists_the_refund_or_state_changes_concurrently(): void
+    {
+        [$payment, $refund] = $this->expiredUnknown();
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->assertSuccessful();
+        $request = DB::table('payment_gateway_refund_closures')->first();
+        $this->operator(1002, 'bob');
+
+        // Race: another process verifies the refund between the pre-check and the atomic close.
+        $this->during = fn () => DB::table('payment_gateway_refunds')->where('id', $refund->id)->update(['status' => 'succeeded', 'active_slot' => null]);
+        $this->artisan('payments:gateway-refund-close-approve', ['request' => $request->id, '--ticket' => 'MT-CASE-12345', '--confirm' => true])
+            ->expectsOutputToContain('berubah bersamaan')->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'succeeded']);
+        $this->assertSame(1, DB::table('payment_gateway_refund_closures')->count());
+
+        [$other, $second] = $this->expiredUnknown('dr-refund-close-04');
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        $this->closeRequest($other, $second, ['--confirm' => true])->assertSuccessful();
+        $this->operator(1002, 'bob');
+        $this->record($other->order_id, 'dr-refund-close-04', 2000, 'Customer refund');
+        $this->artisan('payments:gateway-refund-close-approve', ['request' => DB::table('payment_gateway_refund_closures')->max('id'), '--ticket' => 'MT-CASE-12345', '--confirm' => true])
+            ->expectsOutputToContain('bertentangan dengan konfirmasi')->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $second->id, 'status' => 'succeeded', 'active_slot' => null]);
+
+        $this->travel(73)->hours();
+        [$third, $refund3] = $this->expiredUnknown('dr-refund-close-05');
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        $this->closeRequest($third, $refund3, ['--confirm' => true])->assertSuccessful();
+        $this->travel(73)->hours();
+        $this->operator(1002, 'bob');
+        $this->artisan('payments:gateway-refund-close-approve', ['request' => DB::table('payment_gateway_refund_closures')->max('id'), '--ticket' => 'MT-CASE-12345', '--confirm' => true])
+            ->expectsOutputToContain('kedaluwarsa')->assertFailed();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund3->id, 'status' => 'unknown', 'active_slot' => $third->id]);
+        $this->assertSame(3, $this->posts);
+    }
+
+    public function test_pending_attempt_without_a_recorded_outcome_becomes_unknown_but_keeps_its_slot(): void
+    {
+        $payment = $this->paid();
+        DB::table('payment_gateway_refunds')->insert(['payment_id' => $payment->id, 'refund_key' => 'dr-refund-crash-01', 'amount' => 1000, 'reason' => 'x',
+            'status' => 'pending', 'operator' => 'x', 'environment' => 'sandbox', 'active_slot' => $payment->id, 'attempts' => 1,
+            'last_attempt_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+        $this->refund($payment, ['--reconcile' => true])->expectsOutputToContain('pending -> pending')->assertSuccessful();
+        $this->travel(31)->minutes();
+        $this->refund($payment, ['--reconcile' => true])->expectsOutputToContain('pending -> unknown')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['refund_key' => 'dr-refund-crash-01', 'status' => 'unknown', 'active_slot' => $payment->id]);
+        $this->assertSame(0, $this->posts);
+    }
+
+    /** Unknown refund dr-refund-close-01 (Rp2.000 of Rp5.000) closed by two OS accounts. */
+    private function closedRefund(): array
+    {
+        [$payment, $refund] = $this->expiredUnknown();
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->assertSuccessful();
+        $this->operator(1002, 'bob');
+        $this->artisan('payments:gateway-refund-close-approve', ['request' => DB::table('payment_gateway_refund_closures')->max('id'), '--ticket' => 'MT-CASE-12345', '--confirm' => true])->assertSuccessful();
+
+        return [$payment, DB::table('payment_gateway_refunds')->find($refund->id)];
+    }
+
+    private function manual(object $payment, string $amount, string $reference, bool $confirm = true)
+    {
+        return $this->artisan('payments:refund', ['payment' => $payment->id, '--amount' => $amount, '--reason' => 'Transfer', '--reference' => $reference, '--confirm' => $confirm]);
+    }
+
+    public function test_closed_refund_stays_reserved_and_a_resurrected_refund_is_recorded_once_with_its_history(): void
+    {
+        $logged = new \ArrayObject;
+        Event::listen(MessageLogged::class, fn ($event) => $logged->append([$event->level, $event->message]));
+        Mail::fake();
+        config(['midtrans.alerts.mail_to' => 'ops@example.test']);
+        [$payment, $closed] = $this->closedRefund();
+        $this->assertSame(['closed_unprocessed', null], [$closed->status, $closed->active_slot]);
+
+        // One ledger for manual and gateway refunds: releasing the slot never released the reserved 2000.
+        $this->manual($payment, '5000', 'TRF-AFTER-1')->expectsOutputToContain('Rp2.000 dicadangkan')->assertFailed();
+        $this->refund($payment, ['--amount' => '3001'])->expectsOutputToContain('Rp2.000 dicadangkan')->assertFailed();
+        $this->manual($payment, '3000', 'TRF-AFTER-1')->expectsOutputToContain('refund sebagian')->assertSuccessful();
+        $this->assertSame('paid', DB::table('payments')->where('id', $payment->id)->value('status'));
+
+        // Midtrans lists the "unprocessed" refund after all.
+        $this->record($payment->order_id, 'dr-refund-close-01', 2000, 'Customer refund');
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->expectsOutputToContain('succeeded=1')->assertSuccessful();
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $closed->id, 'status' => 'succeeded', 'amount' => 2000, 'active_slot' => null]);
+        $this->assertSame(2, DB::table('payment_gateway_refund_closures')->where('gateway_refund_id', $closed->id)->count());
+        $this->assertDatabaseHas('payment_gateway_refund_events', ['gateway_refund_id' => $closed->id, 'from_status' => 'closed_unprocessed', 'to_status' => 'succeeded', 'listed_amount' => 2000]);
+        $this->assertDatabaseHas('payment_adjustments', ['payment_id' => $payment->id, 'source' => 'midtrans', 'amount' => 2000,
+            'reference' => 'partial_refund:key:'.hash('sha256', 'dr-refund-close-01')]);
+        $this->assertContains(['error', 'payment.gateway_refund_closed_unprocessed_but_listed'], $logged->getArrayCopy());
+        $this->assertDatabaseCount('payment_refund_anomalies', 0);
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful();
+        $this->assertSame(1, DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans'])->count());
+
+        // A refund made outside the app (e.g. Dashboard) pushes the total over the payment.
+        $this->record($payment->order_id, 'dashboard-refund-1', 1000, 'Dashboard');
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful();
+        $anomaly = DB::table('payment_refund_anomalies')->where('payment_id', $payment->id)->first();
+        $this->assertSame([5000, 6000, 1000], [(int) $anomaly->gross_amount, (int) $anomaly->refunded_amount, (int) $anomaly->excess_amount]);
+        $this->assertSame(['manual' => 3000, 'midtrans' => 3000], array_intersect_key(json_decode($anomaly->evidence, true), ['manual' => 1, 'midtrans' => 1]));
+        $this->assertContains(['error', 'payment.refund_excess'], $logged->getArrayCopy());
+        Mail::assertSent(PaymentAlertMail::class, fn ($mail) => $mail->event === 'payment.refund_excess' && $mail->hasTo('ops@example.test'));
+        Mail::assertSent(PaymentAlertMail::class, fn ($mail) => $mail->event === 'payment.gateway_refund_closed_unprocessed_but_listed');
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful();
+        $this->assertDatabaseCount('payment_refund_anomalies', 1);
+
+        // The combined total reached the payment, so the existing full-refund lifecycle applied.
+        $this->assertSame('refunded', DB::table('payments')->where('id', $payment->id)->value('status'));
+        // Further refunds are blocked; nothing is deleted.
+        $history = DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->get(['source', 'kind', 'amount', 'reference']);
+        $this->manual($payment, '1', 'TRF-AFTER-2')->expectsOutputToContain('berstatus paid')->assertFailed();
+        $this->refund($payment, ['--amount' => '1'])->expectsOutputToContain('berstatus paid')->assertFailed();
+        $this->assertEquals($history, DB::table('payment_adjustments')->where('payment_id', $payment->id)->orderBy('id')->get(['source', 'kind', 'amount', 'reference']));
+        $this->assertSame([['manual', 3000], ['midtrans', 2000], ['midtrans', 1000]], $history->where('kind', 'partial_refund')->map(fn ($row) => [$row->source, (int) $row->amount])->values()->all());
+        $this->assertSame(1, $this->posts);
+        foreach ([fn () => DB::table('payment_refund_anomalies')->delete(), fn () => DB::table('payment_gateway_refund_events')->update(['event' => 'x'])] as $tamper) {
+            try {
+                $tamper();
+                $this->fail('Tampering should be rejected.');
+            } catch (QueryException $exception) {
+                $this->assertStringContainsString('append-only', $exception->getMessage());
+            }
+        }
+    }
+
+    public function test_a_refund_listed_after_a_full_manual_refund_reaches_the_ledger_instead_of_failing_with_422(): void
+    {
+        $payment = $this->paid();
+        $this->manual($payment, '5000', 'TRF-FULL-1')->assertSuccessful();
+        $this->assertSame('refunded', DB::table('payments')->where('id', $payment->id)->value('status'));
+        $this->record($payment->order_id, 'dashboard-late-1', 2000, 'Dashboard');
+
+        app(MidtransSandboxService::class)->applyGatewayStatus($payment->id, $this->status[$payment->order_id]);
+        $this->assertDatabaseHas('payment_adjustments', ['payment_id' => $payment->id, 'source' => 'midtrans', 'kind' => 'partial_refund', 'amount' => 2000, 'status' => 'pending_review']);
+        $this->assertSame([5000, 7000, 2000], array_values((array) DB::table('payment_refund_anomalies')->first(['gross_amount', 'refunded_amount', 'excess_amount'])));
+        $this->assertSame('refunded', DB::table('payments')->where('id', $payment->id)->value('status'));
+        app(MidtransSandboxService::class)->applyGatewayStatus($payment->id, $this->status[$payment->order_id]);
+        $this->assertSame(1, DB::table('payment_adjustments')->where(['payment_id' => $payment->id, 'source' => 'midtrans'])->count());
+        $this->assertDatabaseCount('payment_refund_anomalies', 1);
+    }
+
+    public function test_closed_refunds_are_rechecked_daily_after_thirty_days_without_extra_polling(): void
+    {
+        [$payment, $closed] = $this->closedRefund();
+        $this->travel(31)->days();
+        $count = fn () => tap($this->gets, fn () => $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful());
+        $before = $this->gets;
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful();
+        $this->assertSame($before + 1, $this->gets);
+        $this->travel(6)->hours();
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->assertSuccessful();
+        $this->assertSame($before + 1, $this->gets);
+        $this->travel(19)->hours();
+        $this->record($payment->order_id, 'dr-refund-close-01', 2000, 'Customer refund');
+        $this->artisan('payments:gateway-refunds', ['--reconcile' => true])->expectsOutputToContain('succeeded=1')->assertSuccessful();
+        $this->assertSame($before + 2, $this->gets);
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $closed->id, 'status' => 'succeeded']);
+    }
+
+    public function test_unknown_refund_closure_is_disabled_for_production(): void
+    {
+        [$payment, $refund] = $this->expiredUnknown();
+        $this->travel(145)->hours();
+        $this->operator(1001, 'alice');
+        config(['midtrans.environment' => 'production', 'midtrans.production.server_key' => 'Mid-server-fixture']);
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('dinonaktifkan untuk Production')->assertFailed();
+        config(['midtrans.environment' => 'sandbox']);
+        $this->app['env'] = 'production';
+        $this->closeRequest($payment, $refund, ['--confirm' => true])->expectsOutputToContain('dinonaktifkan untuk Production')->assertFailed();
+        $this->artisan('payments:gateway-refund-close-approve', ['request' => 1, '--ticket' => 'MT-CASE-12345', '--confirm' => true])
+            ->expectsOutputToContain('dinonaktifkan untuk Production')->assertFailed();
+        $this->app['env'] = 'testing';
+        $this->assertDatabaseCount('payment_gateway_refund_closures', 0);
+        $this->assertDatabaseHas('payment_gateway_refunds', ['id' => $refund->id, 'status' => 'unknown', 'active_slot' => $payment->id]);
     }
 }
